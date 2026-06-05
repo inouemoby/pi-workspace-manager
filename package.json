@@ -2,12 +2,12 @@
   "name": "pi-workspace-manager",
   "version": "1.0.0",
   "description": "Cross-workspace session browsing, unified plugin management panel, and startup validation for pi coding agent.",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "pi": {
-    "extensions": ["./index.ts"]
-  },
-  "peerDependencies": {
-    "@earendil-works/pi-coding-agent": "*",
-    "typebox": "*"
+    "extensions": [
+      "./index.ts"
+    ]
   }
 }
