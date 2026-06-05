@@ -59,7 +59,7 @@ Each plugin has three mutually exclusive states:
 | Workspace | Add to current workspace, remove from global | No change |
 | Remove | Remove from its current scope (global or workspace) | No change |
 
-Plugins with missing source files show a ⚠ prefix.
+Plugins with missing source files show a `[MISS]` prefix.
 
 ## Tool: `workspace_sessions`
 

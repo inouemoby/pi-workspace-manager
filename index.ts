@@ -726,7 +726,7 @@ export default function (pi: ExtensionAPI) {
               const cursor = i === selected ? theme.fg("accent", "→") : " ";
               const mark = changed ? theme.fg("warning", "●") : " ";
               const nameMax = Math.max(10, currentWidth - 4 - 20);
-              const prefix = r.installed ? "" : theme.fg("warning", "!! ");
+              const prefix = r.installed ? "       " : theme.fg("warning", "[MISS] ");
               const nameRaw = r.name;
               const nameStr = nameRaw.length > nameMax ? nameRaw.slice(0, nameMax - 1) + "…" : nameRaw.padEnd(nameMax);
               const stateStr = theme.fg(STATE_COLORS[st], STATE_LABELS[st]);
