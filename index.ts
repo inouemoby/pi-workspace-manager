@@ -407,9 +407,9 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
   }
   writeJson(globalPath, globalSettings);
 
-  // Write current workspace settings (only if .pi/ dir exists)
-  const projDir = join(cwd, ".pi");
-  if (existsSync(projDir)) {
+  // Write current workspace settings (skip system directories)
+  const isSystemDir = /^(?:[A-Z]:\\(?:Windows|Program Files|Program Files \(x86\)))\b/i.test(cwd);
+  if (!isSystemDir) {
     projSettings.packages = projPkgs;
     projSettings._disabledPackages = projDisabled;
     // Also sync extensions/skills/themes/prompts overrides with disabled state
