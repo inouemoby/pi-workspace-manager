@@ -484,9 +484,11 @@ export default function (pi: ExtensionAPI) {
     // ═══ 2. Scan ALL workspaces for local resources ═══
     const RESOURCE_DIRS = ["extensions", "skills", "themes", "prompts"];
     const sessionDirs = listSessionDirs();
-    for (const dir of sessionDirs) {
-      const wsCwd = sessionDirToCwd(dir);
+    // Include current workspace even if it has no sessions yet
+    const allWorkspaceCwds = new Set<string>(sessionDirs.map(d => sessionDirToCwd(d)));
+    allWorkspaceCwds.add(cwd);
 
+    for (const wsCwd of allWorkspaceCwds) {
       for (const resType of RESOURCE_DIRS) {
         const wsResDir = join(wsCwd, ".pi", resType);
         if (!existsSync(wsResDir)) continue;
