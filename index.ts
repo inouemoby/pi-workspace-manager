@@ -407,20 +407,23 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
   }
   writeJson(globalPath, globalSettings);
 
-  // Write current workspace settings
-  projSettings.packages = projPkgs;
-  projSettings._disabledPackages = projDisabled;
-  // Also sync extensions/skills/themes/prompts overrides with disabled state
-  const overrideFields = ["extensions", "skills", "themes", "prompts"];
-  for (const field of overrideFields) {
-    const entries: string[] = projSettings[field] || [];
-    const filtered = entries.filter(e => {
-      const resolved = resolve(cwd, e).replace(/\\/g, "/");
-      return !projDisabled.some(d => normalize(d) === resolved);
-    });
-    if (filtered.length !== entries.length) projSettings[field] = filtered;
+  // Write current workspace settings (only if .pi/ dir exists)
+  const projDir = join(cwd, ".pi");
+  if (existsSync(projDir)) {
+    projSettings.packages = projPkgs;
+    projSettings._disabledPackages = projDisabled;
+    // Also sync extensions/skills/themes/prompts overrides with disabled state
+    const overrideFields = ["extensions", "skills", "themes", "prompts"];
+    for (const field of overrideFields) {
+      const entries: string[] = projSettings[field] || [];
+      const filtered = entries.filter(e => {
+        const resolved = resolve(cwd, e).replace(/\\/g, "/");
+        return !projDisabled.some(d => normalize(d) === resolved);
+      });
+      if (filtered.length !== entries.length) projSettings[field] = filtered;
+    }
+    writeJson(projPath, projSettings);
   }
-  writeJson(projPath, projSettings);
 
   // Write other affected workspace settings
   for (const ws of otherWorkspaceSettings) {
