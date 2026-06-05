@@ -922,16 +922,24 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("update", {
-    description: "Update pi to the latest version (runs pi update)",
+    description: "Update pi to the latest version",
     handler: async (_args, ctx) => {
-      try {
-        ctx.ui.notify("Running pi update...", "info");
-        const output = execSync("pi update", { encoding: "utf-8", timeout: 120000 });
-        const lastLine = output.trim().split("\n").pop() || "Done";
+      ctx.ui.notify("Starting pi update...", "info");
+      const child = spawn("pi", ["update"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => {
+        stdout += d.toString();
+        const last = d.toString().trim().split("\n").pop() || "";
+        if (last) ctx.ui.notify("Updating: " + last, "info");
+      });
+      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      await new Promise<void>((resolve) => { child.on("close", () => resolve()); });
+      if (child.exitCode === 0) {
+        const lastLine = stdout.trim().split("\n").pop() || "Done";
         ctx.ui.notify("Update complete: " + lastLine + "\nRun /reload to apply.", "success");
-      } catch (e: any) {
-        const msg = e.stderr?.toString().trim() || e.message;
-        ctx.ui.notify("Update failed: " + msg, "error");
+      } else {
+        ctx.ui.notify("Update failed: " + (stderr.trim() || stdout.trim()), "error");
       }
     },
   });
