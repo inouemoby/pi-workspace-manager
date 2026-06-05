@@ -607,7 +607,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // 1. SESSION BROWSING
+  /* DISABLED: pi now has built-in cross-workspace session support
+    // 1. SESSION BROWSING
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("browse", {
@@ -669,6 +670,7 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(ok ? `Launched: ${workspaceName(targetCwd)}` : "Failed to launch Alacritty.", ok ? "info" : "error");
     },
   });
+  */
 
   // ═══════════════════════════════════════════════════════════
   // 2. PLUGIN MANAGEMENT PANEL
@@ -864,7 +866,8 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // 4. /ws — Quick workspace launcher
+  /* DISABLED: pi now has built-in cross-workspace session support
+    // 4. /ws — Quick workspace launcher
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("ws", {
@@ -910,6 +913,26 @@ export default function (pi: ExtensionAPI) {
       if (!result) return;
       const ok = launchTerminal(result);
       ctx.ui.notify(ok ? `Launched: ${workspaceName(result)}` : "Failed to launch Alacritty.", ok ? "info" : "error");
+    },
+  });
+  */
+
+  // ═══════════════════════════════════════════════════════════
+  // 5. /update — Update pi to latest version
+  // ═══════════════════════════════════════════════════════════
+
+  pi.registerCommand("update", {
+    description: "Update pi to the latest version (runs pi update)",
+    handler: async (_args, ctx) => {
+      try {
+        ctx.ui.notify("Running pi update...", "info");
+        const output = execSync("pi update", { encoding: "utf-8", timeout: 120000 });
+        const lastLine = output.trim().split("\n").pop() || "Done";
+        ctx.ui.notify("Update complete: " + lastLine + "\nRun /reload to apply.", "success");
+      } catch (e: any) {
+        const msg = e.stderr?.toString().trim() || e.message;
+        ctx.ui.notify("Update failed: " + msg, "error");
+      }
     },
   });
 }
