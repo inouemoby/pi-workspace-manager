@@ -1002,23 +1002,24 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
-      // Save resume message + cwd for after restart
+      // Save resume info: message + cwd + session file
+      const sessionFile = ctx.sessionManager.sessionFile;
+      const cwd = ctx.cwd;
       fs.writeFileSync(resumeFlagPath, JSON.stringify({
         message: "pi_reload completed. Continuing from where we left off.",
-        cwd: ctx.cwd,
+        cwd,
+        session: sessionFile,
       }), "utf-8");
-      // Spawn background process: wait for pi to exit, then restart pi in same directory
-      const cwd = ctx.cwd;
+      // Background: wait for pi to exit, then restart pi with same session in same terminal
       if (process.platform === "win32") {
-        spawn("cmd", ["/c", `timeout /t 3 /nobreak >nul & cd /d "${cwd}" & start pi`], {
-          detached: true, stdio: "ignore", shell: false,
+        spawn("cmd", ["/c", `timeout /t 3 /nobreak >nul & cd /d "${cwd}" & pi --session "${sessionFile}"`], {
+          detached: true, stdio: "ignore",
         });
       } else {
-        spawn("sh", ["-c", `sleep 3 && cd "${cwd}" && pi`], {
-          detached: true, stdio: "ignore", shell: false,
+        spawn("sh", ["-c", `sleep 3 && cd "${cwd}" && pi --session "${sessionFile}"`], {
+          detached: true, stdio: "ignore",
         });
       }
-      // Shutdown current pi instance
       ctx.shutdown();
       return { content: [{ type: "text", text: "Restarting pi..." }] };
     },
