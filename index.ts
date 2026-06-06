@@ -17,6 +17,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { spawn, execSync } from "node:child_process";
+import * as fs from "node:fs";
 
 const HOME = homedir();
 const PI_AGENT = join(HOME, ".pi", "agent");
@@ -922,25 +923,24 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   // Internal command: does the actual reload (tools can't call ctx.reload)
+  const resumeFlagPath = path.join(os.homedir(), ".pi", "agent", ".pi-wm-resume");
   pi.registerCommand("pi-wm-reload", {
     description: "Internal: reload with resume (triggered by pi_reload tool)",
     handler: async (_args, ctx) => {
+      // Write flag file so session_start knows this was a tool-triggered reload
+      const msg = _args?.trim() || "pi_reload completed. Continuing from where we left off.";
+      fs.writeFileSync(resumeFlagPath, msg, "utf-8");
       await ctx.reload();
     },
   });
 
-  // After reload: find pending resume message and send it
-  pi.on("session_start", async (_event, ctx) => {
+  // After reload: only send resume if flag file exists (tool-triggered, not manual)
+  pi.on("session_start", async (_event, _ctx) => {
     if (_event.reason !== "reload") return;
-    for (const entry of ctx.sessionManager.getEntries()) {
-      if (entry.type === "custom" && entry.customType === "pi-wm-resume" && !entry.data?.consumed) {
-        const msg = entry.data?.message;
-        if (msg) {
-          entry.data.consumed = true;
-          pi.sendUserMessage(msg);
-        }
-        break;
-      }
+    if (fs.existsSync(resumeFlagPath)) {
+      const msg = fs.readFileSync(resumeFlagPath, "utf-8");
+      fs.unlinkSync(resumeFlagPath);
+      pi.sendUserMessage(msg);
     }
   });
 
@@ -984,9 +984,8 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, _ctx) {
-      // Tools cannot call ctx.reload — save resume state, then trigger reload via command
-      pi.appendEntry("pi-wm-resume", { message: "pi_reload completed. Continuing from where we left off." });
-      pi.sendUserMessage("/pi-wm-reload");
+      // Tools cannot call ctx.reload — trigger via command, pass resume message as arg
+      pi.sendUserMessage("/pi-wm-reload pi_reload completed. Continuing from where we left off.");
       return { content: [{ type: "text", text: "Reloading..." }] };
     },
     renderCall(_args, theme) {
