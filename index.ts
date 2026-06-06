@@ -152,21 +152,43 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   commands.push(["wt.exe", ["-d", cwd, "--", piCmd, "--session", sessionFile]]);
   commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
-  const launcher = `
-    const{spawn,existsSync}=require('child_process');
-    const{join}=require('path');
-    const fs=require('fs');
-    const cmds=${JSON.stringify(commands)};
-    for(const[exe,args]of cmds){
-      try{
-        const p=spawn(exe,args,{detached:true,stdio:'ignore'});
-        p.unref();
-        if(p.pid){process.exit(0);}
-      }catch{}
-    }
-    process.exit(1);
-  `;
-  spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+  if (process.platform === "win32") {
+    // On Windows: spawn terminal via node launcher (to survive process.exit),
+    // then use PowerShell to restore foreground window focus
+    const restoreFocusPs1 = join(homedir(), "bin", "restore-focus.ps1");
+    const launcher = `
+      const{spawn}=require('child_process');
+      const cmds=${JSON.stringify(commands)};
+      for(const[exe,args]of cmds){
+        try{
+          const p=spawn(exe,args,{detached:true,stdio:'ignore'});
+          p.unref();
+          if(p.pid){
+            // Save current foreground window, wait for new window, then restore focus
+            spawn('powershell',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','${restoreFocusPs1.replace(/\\/g,"/")}'],{detached:true,stdio:'ignore'}).unref();
+            process.exit(0);
+          }
+        }catch{}
+      }
+      process.exit(1);
+    `;
+    spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+  } else {
+    // macOS/Linux: just spawn directly via node launcher
+    const launcher = `
+      const{spawn}=require('child_process');
+      const cmds=${JSON.stringify(commands)};
+      for(const[exe,args]of cmds){
+        try{
+          const p=spawn(exe,args,{detached:true,stdio:'ignore'});
+          p.unref();
+          if(p.pid){process.exit(0);}
+        }catch{}
+      }
+      process.exit(1);
+    `;
+    spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+  }
   return true;
 }
 
@@ -1027,6 +1049,14 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
+      launchTerminalDetached(cwd, sessionFile);
+      // Save foreground window before launching new terminal (to restore focus later)
+      if (process.platform === "win32") {
+        try {
+          const savePs1 = join(homedir(), "bin", "save-focus.ps1");
+          if (existsSync(savePs1)) execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${savePs1}"`, { timeout: 3000 });
+        } catch {}
+      }
       launchTerminalDetached(cwd, sessionFile);
       // Use process.exit instead of ctx.shutdown — shutdown only sets a flag
       // and waits for agent_end, but we want to terminate immediately.
