@@ -940,7 +940,7 @@ export default function (pi: ExtensionAPI) {
     if (fs.existsSync(resumeFlagPath)) {
       const msg = fs.readFileSync(resumeFlagPath, "utf-8");
       fs.unlinkSync(resumeFlagPath);
-      pi.sendUserMessage(msg);
+      pi.sendUserMessage(msg, { deliverAs: "followUp" });
     }
   });
 
@@ -985,7 +985,7 @@ export default function (pi: ExtensionAPI) {
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, _ctx) {
       // Tools cannot call ctx.reload — trigger via command, pass resume message as arg
-      pi.sendUserMessage("/pi-wm-reload pi_reload completed. Continuing from where we left off.");
+      pi.sendUserMessage("/pi-wm-reload pi_reload completed. Continuing from where we left off.", { deliverAs: "followUp" });
       return { content: [{ type: "text", text: "Reloading..." }] };
     },
     renderCall(_args, theme) {
