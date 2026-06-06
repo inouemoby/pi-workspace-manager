@@ -135,6 +135,41 @@ function launchTerminal(cwd: string, sessionFile?: string): boolean {
   return false;
 }
 
+/**
+ * Launch terminal via detached node process (survives parent shutdown).
+ * Uses same Alacritty → WT → cmd fallback as launchTerminal.
+ */
+function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
+  const piCmd = process.platform === "win32"
+    ? execSync("where pi.cmd").toString().trim().split("\n")[0].replace(/\\/g, "/")
+    : "pi";
+
+  // Build launch commands in priority order
+  const commands: [string, string[]][] = [];
+  if (existsSync(ALACRITTY)) {
+    commands.push([ALACRITTY, ["--working-directory", cwd, "-e", piCmd, "--session", sessionFile]]);
+  }
+  commands.push(["wt.exe", ["-d", cwd, "--", piCmd, "--session", sessionFile]]);
+  commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
+
+  const launcher = `
+    const{spawn,existsSync}=require('child_process');
+    const{join}=require('path');
+    const fs=require('fs');
+    const cmds=${JSON.stringify(commands)};
+    for(const[exe,args]of cmds){
+      try{
+        const p=spawn(exe,args,{detached:true,stdio:'ignore'});
+        p.unref();
+        if(p.pid){process.exit(0);}
+      }catch{}
+    }
+    process.exit(1);
+  `;
+  spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+  return true;
+}
+
 // ─── Resource Scanning ──────────────────────────────────────
 
 function listInstalledExtensions(): string[] {
@@ -994,18 +1029,7 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      const piCmd = process.platform === "win32"
-        ? execSync("where pi.cmd").toString().trim().split("\n")[0].replace(/\\/g, "/")
-        : "pi";
-      // Must NOT use spawn from pi directly — shutdown kills all tracked detached children.
-      // Use a detached node one-liner that spawns Alacritty independently.
-      const launcher = `
-        const{spawn}=require('child_process');
-        const p=spawn(${JSON.stringify(ALACRITTY)},["--working-directory",${JSON.stringify(cwd)},"-e",${JSON.stringify(piCmd)},"--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
-        p.unref();
-        process.exit(0);
-      `;
-      spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+      launchTerminalDetached(cwd, sessionFile);
       ctx.shutdown();
       return { content: [{ type: "text", text: "Restarting pi..." }] };
     },
