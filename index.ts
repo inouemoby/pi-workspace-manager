@@ -153,19 +153,30 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
   if (process.platform === "win32") {
-    const launcher = `
-      const{spawn}=require('child_process');
-      const cmds=${JSON.stringify(commands)};
-      for(const[exe,args]of cmds){
-        try{
-          const p=spawn(exe,args,{detached:true,stdio:'ignore'});
-          p.unref();
-          if(p.pid){process.exit(0);}
-        }catch{}
-      }
-      process.exit(1);
-    `;
-    spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+    // On Windows: use start-no-focus.ps1 to save/restore foreground window focus
+    // This prevents the new terminal from permanently stealing focus
+    const ps1Path = join(homedir(), "bin", "start-no-focus.ps1");
+    if (existsSync(ps1Path)) {
+      // Use PowerShell script with focus save/restore
+      // Only pass the first command (Alacritty if available, otherwise WT/cmd)
+      const [exe, ...cmdArgs] = commands[0];
+      spawn("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1Path, exe, ...cmdArgs], { detached: true, stdio: "ignore" }).unref();
+    } else {
+      // No focus script available, fall back to direct spawn
+      const launcher = `
+        const{spawn}=require('child_process');
+        const cmds=${JSON.stringify(commands)};
+        for(const[exe,args]of cmds){
+          try{
+            const p=spawn(exe,args,{detached:true,stdio:'ignore'});
+            p.unref();
+            if(p.pid){process.exit(0);}
+          }catch{}
+        }
+        process.exit(1);
+      `;
+      spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+    }
   } else {
     // macOS/Linux: just spawn directly via node launcher
     const launcher = `
