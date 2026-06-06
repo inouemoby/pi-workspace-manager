@@ -1018,7 +1018,8 @@ export default function (pi: ExtensionAPI) {
       `;
       spawn(process.execPath, ["-e", launcherScript], { detached: true, stdio: "ignore" }).unref();
       ctx.shutdown();
-      return { content: [{ type: "text", text: "Restarting pi..." }] };
+      // ctx.shutdown(); // TEMP: disabled for testing
+      return { content: [{ type: "text", text: "Spawned new window. Old pi still running." }] };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
