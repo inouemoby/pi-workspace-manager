@@ -1028,8 +1028,10 @@ export default function (pi: ExtensionAPI) {
         session: sessionFile,
       }), "utf-8");
       launchTerminalDetached(cwd, sessionFile);
-      ctx.shutdown();
-      return { content: [] };
+      // Use process.exit instead of ctx.shutdown — shutdown only sets a flag
+      // and waits for agent_end, but we want to terminate immediately.
+      // The detached launcher process survives process.exit.
+      process.exit(0);
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
