@@ -1044,9 +1044,6 @@ export default function (pi: ExtensionAPI) {
       }), "utf-8");
       launchTerminalDetached(cwd, sessionFile);
       process.exit(0);
-      // ctx.shutdown() waits for agent_end which causes extra response.
-      process.exit(0);
-      process.exit(0);
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
