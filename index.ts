@@ -918,9 +918,81 @@ export default function (pi: ExtensionAPI) {
   */
 
   // ═══════════════════════════════════════════════════════════
-  // 5. /update — Update pi to latest version
+  // ═══════════════════════════════════════════════════════════
+  // 5. Reload recovery — resume conversation after reload
   // ═══════════════════════════════════════════════════════════
 
+  pi.on("session_start", async (_event, ctx) => {
+    if (_event.reason !== "reload") return;
+    // Check for pending resume message saved before reload
+    for (const entry of ctx.sessionManager.getEntries()) {
+      if (entry.type === "custom" && entry.customType === "pi-wm-resume") {
+        const msg = entry.data?.message;
+        if (msg) {
+          pi.sendUserMessage(msg);
+        }
+        break;
+      }
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // 6. Tools — pi_update and pi_reload
+  // ═══════════════════════════════════════════════════════════
+
+  pi.registerTool({
+    name: "pi_update",
+    label: "Pi Update",
+    description: "Update pi to the latest version. Downloads and installs the update, then reloads to apply. Conversation is automatically resumed after reload.",
+    promptSnippet: "Update pi to latest version",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      const child = spawn("pi", ["update"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
+      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
+      await new Promise<void>((resolve) => { child.on("close", () => resolve()); });
+      if (child.exitCode !== 0) {
+        return { content: [{ type: "text", text: "Update failed: " + (stderr.trim() || stdout.trim()) }], isError: true };
+      }
+      const lastLine = stdout.trim().split("\n").pop() || "Done";
+      // Save resume message before reload
+      pi.appendEntry("pi-wm-resume", { message: "pi_update completed: " + lastLine + "\nContinuing from where we left off." });
+      await ctx.reload();
+      return { content: [{ type: "text", text: "Updated: " + lastLine }] };
+    },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("pi_update ")) + theme.fg("dim", "checking..."), 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Updating..."), 0, 0);
+      if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
+      return new Text(theme.fg("success", "✓ Updated"), 0, 0);
+    },
+  });
+
+  pi.registerTool({
+    name: "pi_reload",
+    label: "Pi Reload",
+    description: "Reload pi (extensions, skills, themes, config). Conversation is automatically resumed after reload.",
+    promptSnippet: "Reload pi to apply changes",
+    parameters: Type.Object({}),
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      pi.appendEntry("pi-wm-resume", { message: "pi_reload completed. Continuing from where we left off." });
+      await ctx.reload();
+      return { content: [{ type: "text", text: "Reloaded." }] };
+    },
+    renderCall(_args, theme) {
+      return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "reloading..."), 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Reloading..."), 0, 0);
+      return new Text(theme.fg("success", "✓ Reloaded"), 0, 0);
+    },
+  });
+
+  // Keep /update command as well (non-tool fallback)
   pi.registerCommand("update", {
     description: "Update pi to the latest version",
     handler: async (_args, ctx) => {
