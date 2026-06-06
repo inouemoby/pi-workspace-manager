@@ -153,29 +153,34 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
   if (process.platform === "win32") {
-    // On Windows: use start-no-focus.ps1 to save/restore foreground window focus
-    // This prevents the new terminal from permanently stealing focus
-    const ps1Path = join(homedir(), "bin", "start-no-focus.ps1");
-    if (existsSync(ps1Path)) {
-      // Use PowerShell script with focus save/restore
-      // Only pass the first command (Alacritty if available, otherwise WT/cmd)
-      const [exe, ...cmdArgs] = commands[0];
-      spawn("powershell", ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ps1Path, exe, ...cmdArgs], { detached: true, stdio: "ignore" }).unref();
-    } else {
-      // No focus script available, fall back to direct spawn
-      const launcher = `
-        const{spawn}=require('child_process');
-        const cmds=${JSON.stringify(commands)};
-        for(const[exe,args]of cmds){
-          try{
-            const p=spawn(exe,args,{detached:true,stdio:'ignore'});
-            p.unref();
-            if(p.pid){process.exit(0);}
-          }catch{}
-        }
-        process.exit(1);
-      `;
-      spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+    // On Windows: save foreground window, launch terminal, then restore focus
+    const focusPs1 = join(homedir(), "bin", "restore-focus.ps1").replace(/\\/g, "/");
+    const hasFocusPs1 = existsSync(focusPs1);
+    if (hasFocusPs1) {
+      // Save foreground window handle before launching
+      try {
+        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${focusPs1}" save`, { timeout: 3000, stdio: "ignore" });
+      } catch {}
+    }
+    // Launch terminal via node launcher (survives process.exit)
+    const launcher = `
+      const{spawn}=require('child_process');
+      const cmds=${JSON.stringify(commands)};
+      for(const[exe,args]of cmds){
+        try{
+          const p=spawn(exe,args,{detached:true,stdio:'ignore'});
+          p.unref();
+          if(p.pid){process.exit(0);}
+        }catch{}
+      }
+      process.exit(1);
+    `;
+    spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
+    // Restore foreground window after launch
+    if (hasFocusPs1) {
+      try {
+        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${focusPs1}" restore`, { timeout: 5000, stdio: "ignore" });
+      } catch {}
     }
   } else {
     // macOS/Linux: just spawn directly via node launcher
