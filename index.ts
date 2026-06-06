@@ -1002,7 +1002,6 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
-      // Save resume info: message + cwd + session file
       const sessionFile = ctx.sessionManager.sessionFile;
       const cwd = ctx.cwd;
       fs.writeFileSync(resumeFlagPath, JSON.stringify({
@@ -1010,16 +1009,14 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      // Background: wait for pi to exit, then restart pi with same session in same terminal
-      if (process.platform === "win32") {
-        spawn("cmd", ["/c", `timeout /t 3 /nobreak >nul & cd /d "${cwd}" & pi --session "${sessionFile}"`], {
-          detached: true, stdio: "ignore",
-        });
-      } else {
-        spawn("sh", ["-c", `sleep 3 && cd "${cwd}" && pi --session "${sessionFile}"`], {
-          detached: true, stdio: "ignore",
-        });
-      }
+      // Spawn detached node process: wait 3s then open new Alacritty with pi --session
+      const launcher = `
+        const { spawn } = require('child_process');
+        setTimeout(() => {
+          spawn("${ALACRITTY.replace(/\/g, '\\')}", ["--working-directory", "${cwd}", "-e", "pi", "--session", "${sessionFile}"], { detached: true, stdio: 'ignore' });
+        }, 3000);
+      `;
+      spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
       ctx.shutdown();
       return { content: [{ type: "text", text: "Restarting pi..." }] };
     },
