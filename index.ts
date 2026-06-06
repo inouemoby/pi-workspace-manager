@@ -1049,7 +1049,6 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      launchTerminalDetached(cwd, sessionFile);
       // Save foreground window before launching new terminal (to restore focus later)
       if (process.platform === "win32") {
         try {
@@ -1058,9 +1057,9 @@ export default function (pi: ExtensionAPI) {
         } catch {}
       }
       launchTerminalDetached(cwd, sessionFile);
-      // Use process.exit instead of ctx.shutdown — shutdown only sets a flag
-      // and waits for agent_end, but we want to terminate immediately.
-      // The detached launcher process survives process.exit.
+      // Shutdown immediately — use process.exit to avoid stale agent turns.
+      // ctx.shutdown() waits for agent_end which causes extra response.
+      process.exit(0);
       process.exit(0);
     },
     renderCall(_args, theme) {
