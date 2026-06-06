@@ -926,18 +926,8 @@ export default function (pi: ExtensionAPI) {
   // 5. Reload recovery
   // ═══════════════════════════════════════════════════════════
 
-  // Flag file: pi_reload tool writes it before triggering reload
+  // Flag file: pi_reload tool writes it before triggering restart
   const resumeFlagPath = join(homedir(), ".pi", "agent", ".pi-wm-resume");
-
-  // Internal command: does the actual reload + writes resume flag
-  pi.registerCommand("pi-wm-reload", {
-    description: "Internal: reload pi with conversation resume",
-    handler: async (_args, ctx) => {
-      const msg = _args?.trim() || "pi_reload completed. Continuing from where we left off.";
-      fs.writeFileSync(resumeFlagPath, msg, "utf-8");
-      await ctx.reload();
-    },
-  });
 
   // After restart: if flag exists, send resume message to continue conversation
   // After restart: if flag exists, just notify user that session was resumed
@@ -1004,22 +994,20 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      // Spawn detached node process: wait for old pi to exit, then open new Alacritty
-      const alcPath = ALACRITTY.replace(/\\/g, "/");
-      // Resolve pi command full path
       const piCmd = process.platform === "win32"
-        ? execSync("where pi").toString().trim().split("\n")[0].replace(/\\/g, "/")
+        ? execSync("where pi.cmd").toString().trim().split("\n")[0].replace(/\\/g, "/")
         : "pi";
-      const launcherScript = `
+      // Must NOT use spawn from pi directly — shutdown kills all tracked detached children.
+      // Use a detached node one-liner that spawns Alacritty independently.
+      const launcher = `
         const{spawn}=require('child_process');
-        setTimeout(()=>{
-          spawn(${JSON.stringify(alcPath)},["--working-directory",${JSON.stringify(cwd)},"-e",${JSON.stringify(piCmd)},"--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
-        },3000);
+        const p=spawn(${JSON.stringify(ALACRITTY)},["--working-directory",${JSON.stringify(cwd)},"-e",${JSON.stringify(piCmd)},"--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
+        p.unref();
+        process.exit(0);
       `;
-      spawn(process.execPath, ["-e", launcherScript], { detached: true, stdio: "ignore" }).unref();
+      spawn(process.execPath, ["-e", launcher], { detached: true, stdio: "ignore" }).unref();
       ctx.shutdown();
-      // ctx.shutdown(); // TEMP: disabled for testing
-      return { content: [{ type: "text", text: "Spawned new window. Old pi still running." }] };
+      return { content: [{ type: "text", text: "Restarting pi..." }] };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
