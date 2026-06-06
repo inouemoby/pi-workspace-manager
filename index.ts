@@ -924,11 +924,13 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     if (_event.reason !== "reload") return;
-    // Check for pending resume message saved before reload
+    // Check for pending resume message saved by pi_reload tool
     for (const entry of ctx.sessionManager.getEntries()) {
-      if (entry.type === "custom" && entry.customType === "pi-wm-resume") {
+      if (entry.type === "custom" && entry.customType === "pi-wm-resume" && !entry.data?.consumed) {
         const msg = entry.data?.message;
         if (msg) {
+          // Mark consumed so manual /reload won't re-trigger
+          entry.data.consumed = true;
           pi.sendUserMessage(msg);
         }
         break;
