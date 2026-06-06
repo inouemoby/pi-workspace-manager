@@ -965,7 +965,6 @@ export default function (pi: ExtensionAPI) {
   const resumeFlagPath = join(homedir(), ".pi", "agent", ".pi-wm-resume");
 
   // After restart: if flag exists, send resume message to continue conversation
-  // After restart: if flag exists, just notify user that session was resumed
   pi.on("session_start", async (_event, _ctx) => {
     if (!fs.existsSync(resumeFlagPath)) return;
     let data: { message: string };
@@ -975,7 +974,6 @@ export default function (pi: ExtensionAPI) {
       data = { message: fs.readFileSync(resumeFlagPath, "utf-8") };
     }
     fs.unlinkSync(resumeFlagPath);
-    // Delay until agent is fully idle, then send resume as user message
     const trySend = async () => {
       try { await pi.sendUserMessage(data.message); } catch { setTimeout(trySend, 1000); }
     };
@@ -1031,7 +1029,7 @@ export default function (pi: ExtensionAPI) {
       }), "utf-8");
       launchTerminalDetached(cwd, sessionFile);
       ctx.shutdown();
-      return { content: [{ type: "text", text: "Restarting pi..." }] };
+      return { content: [] };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
