@@ -153,9 +153,6 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
   if (process.platform === "win32") {
-    // On Windows: spawn terminal via node launcher (to survive process.exit),
-    // then use PowerShell to restore foreground window focus
-    const restoreFocusPs1 = join(homedir(), "bin", "restore-focus.ps1");
     const launcher = `
       const{spawn}=require('child_process');
       const cmds=${JSON.stringify(commands)};
@@ -163,11 +160,7 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
         try{
           const p=spawn(exe,args,{detached:true,stdio:'ignore'});
           p.unref();
-          if(p.pid){
-            // Save current foreground window, wait for new window, then restore focus
-            spawn('powershell',['-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','${restoreFocusPs1.replace(/\\/g,"/")}'],{detached:true,stdio:'ignore'}).unref();
-            process.exit(0);
-          }
+          if(p.pid){process.exit(0);}
         }catch{}
       }
       process.exit(1);
@@ -1049,15 +1042,8 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      // Save foreground window before launching new terminal (to restore focus later)
-      if (process.platform === "win32") {
-        try {
-          const savePs1 = join(homedir(), "bin", "save-focus.ps1");
-          if (existsSync(savePs1)) execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${savePs1}"`, { timeout: 3000, stdio: 'ignore' });
-        } catch {}
-      }
       launchTerminalDetached(cwd, sessionFile);
-      // Shutdown immediately — use process.exit to avoid stale agent turns.
+      process.exit(0);
       // ctx.shutdown() waits for agent_end which causes extra response.
       process.exit(0);
       process.exit(0);
