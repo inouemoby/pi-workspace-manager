@@ -923,7 +923,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   // Internal command: does the actual reload (tools can't call ctx.reload)
-  const resumeFlagPath = path.join(os.homedir(), ".pi", "agent", ".pi-wm-resume");
+  const resumeFlagPath = join(homedir(), ".pi", "agent", ".pi-wm-resume");
   pi.registerCommand("pi-wm-reload", {
     description: "Internal: reload with resume (triggered by pi_reload tool)",
     handler: async (_args, ctx) => {
