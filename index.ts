@@ -940,7 +940,8 @@ export default function (pi: ExtensionAPI) {
     if (fs.existsSync(resumeFlagPath)) {
       const msg = fs.readFileSync(resumeFlagPath, "utf-8");
       fs.unlinkSync(resumeFlagPath);
-      setTimeout(() => pi.sendUserMessage(msg), 3000);
+      const trySend = () => { try { pi.sendUserMessage(msg); } catch { setTimeout(trySend, 500); } };
+      setTimeout(trySend, 1000);
     }
   });
 
