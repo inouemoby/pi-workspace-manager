@@ -940,26 +940,21 @@ export default function (pi: ExtensionAPI) {
   });
 
   // After restart: if flag exists, send resume message to continue conversation
+  // After restart: if flag exists, just notify user that session was resumed
   pi.on("session_start", async (_event, _ctx) => {
     if (!fs.existsSync(resumeFlagPath)) return;
-    let data: { message: string; cwd?: string };
+    let data: { message: string };
     try {
       data = JSON.parse(fs.readFileSync(resumeFlagPath, "utf-8"));
     } catch {
       data = { message: fs.readFileSync(resumeFlagPath, "utf-8") };
     }
     fs.unlinkSync(resumeFlagPath);
-    const pollSend = async () => {
-      try {
-        await pi.sendMessage(
-          { customType: "pi-wm-resume", content: data.message },
-          { triggerTurn: true }
-        );
-      } catch {
-        setTimeout(pollSend, 500);
-      }
+    // Delay until agent is fully idle, then send resume as user message
+    const trySend = async () => {
+      try { await pi.sendUserMessage(data.message); } catch { setTimeout(trySend, 1000); }
     };
-    setTimeout(pollSend, 1500);
+    setTimeout(trySend, 3000);
   });
 
   // ═══════════════════════════════════════════════════════════
