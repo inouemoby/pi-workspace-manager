@@ -1053,7 +1053,7 @@ export default function (pi: ExtensionAPI) {
       if (process.platform === "win32") {
         try {
           const savePs1 = join(homedir(), "bin", "save-focus.ps1");
-          if (existsSync(savePs1)) execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${savePs1}"`, { timeout: 3000 });
+          if (existsSync(savePs1)) execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${savePs1}"`, { timeout: 3000, stdio: 'ignore' });
         } catch {}
       }
       launchTerminalDetached(cwd, sessionFile);
