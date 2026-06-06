@@ -957,10 +957,7 @@ export default function (pi: ExtensionAPI) {
         return { content: [{ type: "text", text: "Update failed: " + (stderr.trim() || stdout.trim()) }], isError: true };
       }
       const lastLine = stdout.trim().split("\n").pop() || "Done";
-      // Save resume message before reload
-      pi.appendEntry("pi-wm-resume", { message: "pi_update completed: " + lastLine + "\nContinuing from where we left off." });
-      await ctx.reload();
-      return { content: [{ type: "text", text: "Updated: " + lastLine }] };
+      return { content: [{ type: "text", text: "Update complete: " + lastLine + "\nUse pi_reload to apply." }] };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_update ")) + theme.fg("dim", "checking..."), 0, 0);
