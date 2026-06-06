@@ -1009,11 +1009,12 @@ export default function (pi: ExtensionAPI) {
         cwd,
         session: sessionFile,
       }), "utf-8");
-      // Spawn detached node process: wait 3s then open new Alacritty with pi --session
+      // Spawn detached node process: wait for old pi to exit, then open new Alacritty
+      const alcPath = ALACRITTY.replace(/\\/g, "/");
       const launcherScript = `
         const{spawn}=require('child_process');
         setTimeout(()=>{
-          spawn(${JSON.stringify(ALACRITTY)},["--working-directory",${JSON.stringify(cwd)},"-e","pi","--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
+          spawn(${JSON.stringify(alcPath)},["--working-directory",${JSON.stringify(cwd)},"-e","pi","--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
         },3000);
       `;
       spawn(process.execPath, ["-e", launcherScript], { detached: true, stdio: "ignore" }).unref();
