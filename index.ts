@@ -1011,10 +1011,14 @@ export default function (pi: ExtensionAPI) {
       }), "utf-8");
       // Spawn detached node process: wait for old pi to exit, then open new Alacritty
       const alcPath = ALACRITTY.replace(/\\/g, "/");
+      // Resolve pi command full path
+      const piCmd = process.platform === "win32"
+        ? execSync("where pi").toString().trim().split("\n")[0].replace(/\\/g, "/")
+        : "pi";
       const launcherScript = `
         const{spawn}=require('child_process');
         setTimeout(()=>{
-          spawn(${JSON.stringify(alcPath)},["--working-directory",${JSON.stringify(cwd)},"-e","pi","--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
+          spawn(${JSON.stringify(alcPath)},["--working-directory",${JSON.stringify(cwd)},"-e",${JSON.stringify(piCmd)},"--session",${JSON.stringify(sessionFile)}],{detached:true,stdio:'ignore'});
         },3000);
       `;
       spawn(process.execPath, ["-e", launcherScript], { detached: true, stdio: "ignore" }).unref();
