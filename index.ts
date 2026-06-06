@@ -922,27 +922,44 @@ export default function (pi: ExtensionAPI) {
   // 5. Reload command + recovery
   // ═══════════════════════════════════════════════════════════
 
-  // Internal command: does the actual reload (tools can't call ctx.reload)
+  // ═══════════════════════════════════════════════════════════
+  // 5. Reload recovery
+  // ═══════════════════════════════════════════════════════════
+
+  // Flag file: pi_reload tool writes it before triggering reload
   const resumeFlagPath = join(homedir(), ".pi", "agent", ".pi-wm-resume");
+
+  // Internal command: does the actual reload + writes resume flag
   pi.registerCommand("pi-wm-reload", {
-    description: "Internal: reload with resume (triggered by pi_reload tool)",
+    description: "Internal: reload pi with conversation resume",
     handler: async (_args, ctx) => {
-      // Write flag file so session_start knows this was a tool-triggered reload
       const msg = _args?.trim() || "pi_reload completed. Continuing from where we left off.";
       fs.writeFileSync(resumeFlagPath, msg, "utf-8");
       await ctx.reload();
     },
   });
 
-  // After reload: only send resume if flag file exists (tool-triggered, not manual)
+  // After restart: if flag exists, send resume message to continue conversation
   pi.on("session_start", async (_event, _ctx) => {
-    if (_event.reason !== "reload") return;
-    if (fs.existsSync(resumeFlagPath)) {
-      const msg = fs.readFileSync(resumeFlagPath, "utf-8");
-      fs.unlinkSync(resumeFlagPath);
-      const trySend = async () => { try { await pi.sendUserMessage(msg); } catch { setTimeout(trySend, 500); } };
-      setTimeout(trySend, 1000);
+    if (!fs.existsSync(resumeFlagPath)) return;
+    let data: { message: string; cwd?: string };
+    try {
+      data = JSON.parse(fs.readFileSync(resumeFlagPath, "utf-8"));
+    } catch {
+      data = { message: fs.readFileSync(resumeFlagPath, "utf-8") };
     }
+    fs.unlinkSync(resumeFlagPath);
+    const pollSend = async () => {
+      try {
+        await pi.sendMessage(
+          { customType: "pi-wm-resume", content: data.message },
+          { triggerTurn: true }
+        );
+      } catch {
+        setTimeout(pollSend, 500);
+      }
+    };
+    setTimeout(pollSend, 1500);
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -981,20 +998,36 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_reload",
     label: "Pi Reload",
-    description: "Reload pi (extensions, skills, themes, config). Conversation is automatically resumed after reload.",
+    description: "Restart pi to reload extensions, skills, themes, and config. Conversation is automatically resumed after restart.",
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, _ctx) {
-      // Tools cannot call ctx.reload — trigger via command, pass resume message as arg
-      pi.sendUserMessage("/pi-wm-reload pi_reload completed. Continuing from where we left off.");
-      return { content: [{ type: "text", text: "Reloading..." }] };
+    async execute(_id, _params, _signal, _onUpdate, ctx) {
+      // Save resume message + cwd for after restart
+      fs.writeFileSync(resumeFlagPath, JSON.stringify({
+        message: "pi_reload completed. Continuing from where we left off.",
+        cwd: ctx.cwd,
+      }), "utf-8");
+      // Spawn background process: wait for pi to exit, then restart pi in same directory
+      const cwd = ctx.cwd;
+      if (process.platform === "win32") {
+        spawn("cmd", ["/c", `timeout /t 3 /nobreak >nul & cd /d "${cwd}" & start pi`], {
+          detached: true, stdio: "ignore", shell: false,
+        });
+      } else {
+        spawn("sh", ["-c", `sleep 3 && cd "${cwd}" && pi`], {
+          detached: true, stdio: "ignore", shell: false,
+        });
+      }
+      // Shutdown current pi instance
+      ctx.shutdown();
+      return { content: [{ type: "text", text: "Restarting pi..." }] };
     },
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "reloading..."), 0, 0);
+      return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "restarting..."), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Reloading..."), 0, 0);
-      return new Text(theme.fg("success", "\u2713 Reloaded"), 0, 0);
+      if (isPartial) return new Text(theme.fg("warning", "Restarting..."), 0, 0);
+      return new Text(theme.fg("success", "\u2713 Restarted"), 0, 0);
     },
   });
 
