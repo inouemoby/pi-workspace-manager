@@ -918,18 +918,24 @@ export default function (pi: ExtensionAPI) {
   */
 
   // ═══════════════════════════════════════════════════════════
-  // ═══════════════════════════════════════════════════════════
-  // 5. Reload recovery — resume conversation after reload
+  // 5. Reload command + recovery
   // ═══════════════════════════════════════════════════════════
 
+  // Internal command: does the actual reload (tools can't call ctx.reload)
+  pi.registerCommand("pi-wm-reload", {
+    description: "Internal: reload with resume (triggered by pi_reload tool)",
+    handler: async (_args, ctx) => {
+      await ctx.reload();
+    },
+  });
+
+  // After reload: find pending resume message and send it
   pi.on("session_start", async (_event, ctx) => {
     if (_event.reason !== "reload") return;
-    // Check for pending resume message saved by pi_reload tool
     for (const entry of ctx.sessionManager.getEntries()) {
       if (entry.type === "custom" && entry.customType === "pi-wm-resume" && !entry.data?.consumed) {
         const msg = entry.data?.message;
         if (msg) {
-          // Mark consumed so manual /reload won't re-trigger
           entry.data.consumed = true;
           pi.sendUserMessage(msg);
         }
@@ -945,10 +951,10 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_update",
     label: "Pi Update",
-    description: "Update pi to the latest version. Downloads and installs the update, then reloads to apply. Conversation is automatically resumed after reload.",
+    description: "Update pi to the latest version. Downloads and installs the update. Run pi_reload after to apply.",
     promptSnippet: "Update pi to latest version",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
       const child = spawn("pi", ["update"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
       let stdout = "";
       let stderr = "";
@@ -962,12 +968,12 @@ export default function (pi: ExtensionAPI) {
       return { content: [{ type: "text", text: "Update complete: " + lastLine + "\nUse pi_reload to apply." }] };
     },
     renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("pi_update ")) + theme.fg("dim", "checking..."), 0, 0);
+      return new Text(theme.fg("toolTitle", theme.bold("pi_update ")) + theme.fg("dim", "updating..."), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Updating..."), 0, 0);
       if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
-      return new Text(theme.fg("success", "✓ Updated"), 0, 0);
+      return new Text(theme.fg("success", "\u2713 Updated"), 0, 0);
     },
   });
 
@@ -977,17 +983,18 @@ export default function (pi: ExtensionAPI) {
     description: "Reload pi (extensions, skills, themes, config). Conversation is automatically resumed after reload.",
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, ctx) {
+    async execute(_id, _params, _signal, _onUpdate, _ctx) {
+      // Tools cannot call ctx.reload — save resume state, then trigger reload via command
       pi.appendEntry("pi-wm-resume", { message: "pi_reload completed. Continuing from where we left off." });
-      await ctx.reload();
-      return { content: [{ type: "text", text: "Reloaded." }] };
+      pi.sendUserMessage("/pi-wm-reload");
+      return { content: [{ type: "text", text: "Reloading..." }] };
     },
     renderCall(_args, theme) {
       return new Text(theme.fg("toolTitle", theme.bold("pi_reload ")) + theme.fg("dim", "reloading..."), 0, 0);
     },
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Reloading..."), 0, 0);
-      return new Text(theme.fg("success", "✓ Reloaded"), 0, 0);
+      return new Text(theme.fg("success", "\u2713 Reloaded"), 0, 0);
     },
   });
 
