@@ -159,7 +159,7 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
     if (hasFocusPs1) {
       // Save foreground window handle before launching
       try {
-        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${focusPs1}" save`, { timeout: 3000, stdio: "ignore" });
+        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${focusPs1}" save`, { timeout: 3000, stdio: "ignore" });
       } catch {}
     }
     // Launch terminal via node launcher (survives process.exit)
@@ -179,7 +179,7 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
     // Restore foreground window after launch
     if (hasFocusPs1) {
       try {
-        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File "${focusPs1}" restore`, { timeout: 5000, stdio: "ignore" });
+        execSync(`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${focusPs1}" restore`, { timeout: 5000, stdio: "ignore" });
       } catch {}
     }
   } else {
