@@ -154,7 +154,9 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
 
   if (process.platform === "win32") {
     // On Windows: save foreground window, launch terminal, then restore focus
-    const focusPs1 = join(homedir(), "bin", "restore-focus.ps1").replace(/\\/g, "/");
+    // Look for focus scripts in plugin's own bin/ directory
+    const pluginBin = join(PI_AGENT, "git", "github.com", "inouemoby", "pi-workspace-manager", "bin");
+    const focusPs1 = join(pluginBin, "restore-focus.ps1").replace(/\\/g, "/");
     const hasFocusPs1 = existsSync(focusPs1);
     if (hasFocusPs1) {
       // Save foreground window handle before launching
