@@ -582,11 +582,14 @@ export default function (pi: ExtensionAPI) {
         } catch { continue; }
         if (resFiles.length === 0) continue;
 
-        // Add .ignore to block auto-discover
+        // Add/fix .ignore to block auto-discover
         const ignorePath = join(wsResDir, ".ignore");
-        if (!existsSync(ignorePath)) {
+        let needIgnore = false;
+        if (!existsSync(ignorePath)) { needIgnore = true; }
+        else { if (readFileSync(ignorePath, "utf-8").trim() !== "*") needIgnore = true; }
+        if (needIgnore) {
           writeFileSync(ignorePath, "*\n", "utf-8");
-          messages.push(`${workspaceName(wsCwd)}: added .ignore to ${resType}`);
+          messages.push(`${workspaceName(wsCwd)}: ensured ${resType}/.ignore`);
         }
 
         // Register to workspace's .pi/settings.json
@@ -645,14 +648,28 @@ export default function (pi: ExtensionAPI) {
       const gDisabled: string[] = gs._disabledPackages || [];
       const normalize = (p: string) => p.replace(/\\/g, "/");
       const isDisabled = (ref: string) => gDisabled.some(d => normalize(d) === normalize(ref));
+      const isInGlobalPkgs = (ref: string) => gPkgs.some(p => normalize(p) === normalize(ref));
+      // Check if registered in any workspace — don't override user's scope choice
+      const isInAnyWorkspace = (pkgRef: string) => {
+        for (const dir of listSessionDirs()) {
+          const wsCwd = sessionDirToCwd(dir);
+          const wsSettings = readJson(join(wsCwd, ".pi", "settings.json"));
+          const wsPkgs: string[] = wsSettings.packages || [];
+          if (wsPkgs.some(p => normalize(p).endsWith("/" + pkgRef.split("/").pop()))) return true;
+        }
+        const projSettings2 = readJson(join(cwd, ".pi", "settings.json"));
+        const projPkgs2: string[] = projSettings2.packages || [];
+        if (projPkgs2.some(p => normalize(p).endsWith("/" + pkgRef.split("/").pop()))) return true;
+        return false;
+      };
       let added = 0;
       for (const res of resFiles) {
         const pkgRef = `${resType}/${res}`;
-        if (isDisabled(pkgRef)) continue; // skip disabled plugins
-        if (!gPkgs.includes(pkgRef)) {
-          gPkgs.push(pkgRef);
-          added++;
-        }
+        if (isDisabled(pkgRef)) continue; // removed by user
+        if (isInGlobalPkgs(pkgRef)) continue; // already global
+        if (isInAnyWorkspace(pkgRef)) continue; // user set to workspace — don't steal
+        gPkgs.push(pkgRef);
+        added++;
       }
       if (added > 0) {
         gs.packages = gPkgs;
@@ -660,11 +677,14 @@ export default function (pi: ExtensionAPI) {
         messages.push(`Global: registered ${added} ${resType}(s)`);
       }
 
-      // Create .ignore AFTER registration to prevent double-loading
+      // Create/fix .ignore AFTER registration to prevent double-loading
       const ignorePath = join(globalResDir, ".ignore");
-      if (!existsSync(ignorePath)) {
+      let needWrite = false;
+      if (!existsSync(ignorePath)) { needWrite = true; }
+      else { if (readFileSync(ignorePath, "utf-8").trim() !== "*") needWrite = true; }
+      if (needWrite) {
         writeFileSync(ignorePath, "*\n", "utf-8");
-        messages.push(`Global: created ${resType}/.ignore`);
+        messages.push(`Global: ensured ${resType}/.ignore`);
       }
     }
 
