@@ -239,13 +239,37 @@ function listInstalledGitPackages(): string[] {
   return results;
 }
 
+/**
+ * Recursively find all directories containing SKILL.md under baseDir.
+ * Returns POSIX-style relative paths from baseDir.
+ * A SKILL.md marks a skill boundary — stop recursing once found.
+ * Skips .git and node_modules, but traverses other dot-directories
+ * (e.g. .claude/skills/...) where skills may nest in Claude-style repos.
+ */
+function findSkillDirs(baseDir: string): string[] {
+  const results: string[] = [];
+  const walk = (dir: string, rel: string) => {
+    if (existsSync(join(dir, "SKILL.md"))) {
+      if (rel) results.push(rel);
+      return; // skill boundary — don't recurse into skill internals
+    }
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return; }
+    for (const name of entries) {
+      if (name === ".git" || name === "node_modules" || name === ".ignore") continue;
+      const full = join(dir, name);
+      try { if (!statSync(full).isDirectory()) continue; } catch { continue; }
+      walk(full, rel ? `${rel}/${name}` : name);
+    }
+  };
+  walk(baseDir, "");
+  return results;
+}
+
 function listInstalledSkills(): string[] {
   const dir = join(PI_AGENT, "skills");
   try {
-    return readdirSync(dir).filter(f => {
-      if (f.startsWith(".") || f === ".gitignore") return false;
-      return statSync(join(dir, f)).isDirectory();
-    });
+    return findSkillDirs(dir);
   } catch { return []; }
 }
 
@@ -269,21 +293,37 @@ interface ManagedResource {
   name: string;     // display name
   installed: boolean;
   state: ResourceState;
+  type: "skill" | "package";  // skill → skills[] array, package → packages[] array
 }
 
 function buildResourceIndex(cwd: string): ManagedResource[] {
   const normalize = (p: string) => p.replace(/\\/g, "/");
 
   const globalSettings = readJson(join(PI_AGENT, "settings.json"));
-  const globalPkgs: string[] = globalSettings.packages || [];
-  const globalDisabled: string[] = globalSettings._disabledPackages || [];
-
   const projSettings = readJson(join(cwd, ".pi", "settings.json"));
-  const projPkgs: string[] = projSettings.packages || [];
-  const projDisabled: string[] = projSettings._disabledPackages || [];
 
-  // Resolve all registered refs (packages + extensions/skills/themes/prompts overrides)
-  const overrideFields = ["extensions", "skills", "themes", "prompts"];
+  // ── Skills channel: skills[] array (relative paths, no resolve) ──
+  // Skills are registered as relative paths like "skills/repo/.claude/skills/x"
+  // and stored verbatim in settings.skills[]. State is determined by exact
+  // string match against skills[] — never resolved to absolute.
+  const globalActiveSkills: string[] = globalSettings.skills || [];
+  const projActiveSkills: string[] = projSettings.skills || [];
+  const allWsSkillRefs = new Set<string>();
+  for (const dir of listSessionDirs()) {
+    const wsCwd = sessionDirToCwd(dir);
+    const wsSettings = readJson(join(wsCwd, ".pi", "settings.json"));
+    for (const s of wsSettings.skills || []) allWsSkillRefs.add(normalize(s));
+  }
+
+  const getSkillState = (id: string): ResourceState => {
+    const nid = normalize(id);
+    if (globalActiveSkills.some(p => normalize(p) === nid)) return "global";
+    if (projActiveSkills.some(p => normalize(p) === nid)) return "workspace";
+    return "removed";
+  };
+
+  // ── Packages channel: packages[] array + extensions/themes/prompts overrides (existing behavior) ──
+  const overrideFields = ["extensions", "themes", "prompts"];
   const resolveRel = (rawId: string, base: string) => {
     if (rawId.startsWith("git:") || rawId.startsWith("npm:") || rawId.startsWith("github:")) return rawId;
     if (rawId.includes(":") || rawId.startsWith("/")) return rawId;
@@ -312,7 +352,7 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
     for (const ref of collectAllRefs(wsSettings, wsCwd)) allWorkspaceRefs.add(ref);
   }
 
-  const getState = (id: string): ResourceState => {
+  const getPkgState = (id: string): ResourceState => {
     const nid = normalize(id);
     if (globalActiveRefs.some(p => normalize(p) === nid)) return "global";
     if (projActiveRefs.some(p => normalize(p) === nid)) return "workspace";
@@ -322,18 +362,24 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
   const resources: ManagedResource[] = [];
   const seen = new Set<string>();
 
-  const add = (id: string, name: string) => {
+  const add = (id: string, name: string, type: "skill" | "package") => {
     const nid = normalize(id);
     if (seen.has(nid)) return;
     seen.add(nid);
-    resources.push({ id: nid, name, installed: true, state: getState(id) });
+    const state = type === "skill" ? getSkillState(id) : getPkgState(id);
+    resources.push({ id: nid, name, installed: true, state, type });
   };
 
-  // Physical scan — global
-  for (const ext of listInstalledExtensions()) add(`extensions/${ext}`, ext);
-  for (const git of listInstalledGitPackages()) add(git, git.split("/").pop() || git);
-  for (const skill of listInstalledSkills()) add(`skills/${skill}`, skill);
-  for (const theme of listInstalledThemes()) add(`themes/${theme}`, theme);
+  // Physical scan — global skills (recursive, finds nested SKILL.md)
+  // ID = "skills/<relpath>" (matches settings entry); name = last path segment
+  for (const skill of listInstalledSkills()) {
+    const display = skill.split("/").pop() || skill;
+    add(`skills/${skill}`, display, "skill");
+  }
+  // Physical scan — global packages
+  for (const ext of listInstalledExtensions()) add(`extensions/${ext}`, ext, "package");
+  for (const git of listInstalledGitPackages()) add(git, git.split("/").pop() || git, "package");
+  for (const theme of listInstalledThemes()) add(`themes/${theme}`, theme, "package");
 
   // Physical scan — workspace-local .pi/ resources
   const WS_RES_TYPES = ["extensions", "skills", "themes", "prompts"];
@@ -341,6 +387,15 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
     const wsResDir = join(cwd, ".pi", resType);
     if (!existsSync(wsResDir)) continue;
     try {
+      if (resType === "skills") {
+        // Recursive skill discovery in workspace .pi/skills/
+        // ID format: "skills/<relpath>" to match settings.skills[] entries (resolved against cwd/.pi)
+        for (const rel of findSkillDirs(wsResDir)) {
+          const display = rel.split("/").pop() || rel;
+          add(`skills/${rel}`, display, "skill");
+        }
+        continue;
+      }
       for (const f of readdirSync(wsResDir)) {
         if (f.startsWith(".") || f === ".ignore") continue;
         const full = join(wsResDir, f);
@@ -350,26 +405,32 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
         if (resType === "extensions") {
           valid = f.endsWith(".ts") || f.endsWith(".mjs") || f.endsWith(".js") ||
             (statSync(full).isDirectory() && (existsSync(join(full, "index.ts")) || existsSync(join(full, "index.js"))));
-        } else if (resType === "skills") {
-          valid = statSync(full).isDirectory() && existsSync(join(full, "SKILL.md"));
         } else {
           valid = f.endsWith(".js") || f.endsWith(".ts") || f.endsWith(".md") || statSync(full).isDirectory();
         }
         if (valid) {
           seen.add(absPath);
-          resources.push({ id: absPath, name: f, installed: true, state: getState(absPath) });
+          resources.push({ id: absPath, name: f, installed: true, state: getPkgState(absPath), type: "package" });
         }
       }
     } catch { /* */ }
   }
 
-  // Add remaining from all settings that weren't physically found
+  // Add remaining from settings that weren't physically found (packages channel only)
   const allRegisteredIds = new Set([...globalAllRefs, ...projAllRefs, ...allWorkspaceRefs]);
   for (const rawId of allRegisteredIds) {
     const id = normalize(rawId);
     if (!seen.has(id)) {
       seen.add(id);
-      resources.push({ id, name: id.split("/").pop() || id, installed: existsSync(id) || rawId.startsWith("git:") || rawId.startsWith("npm:"), state: getState(id) });
+      resources.push({ id, name: id.split("/").pop() || id, installed: existsSync(id) || rawId.startsWith("git:") || rawId.startsWith("npm:"), state: getPkgState(id), type: "package" });
+    }
+  }
+  // Add skill refs from settings not physically found
+  for (const rawId of [...globalActiveSkills, ...projActiveSkills, ...allWsSkillRefs]) {
+    const id = normalize(rawId);
+    if (!seen.has(id)) {
+      seen.add(id);
+      resources.push({ id, name: id.split("/").pop() || id, installed: existsSync(resolve(PI_AGENT, id)), state: getSkillState(id), type: "skill" });
     }
   }
 
@@ -381,78 +442,84 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
   if (changes.size === 0) return;
 
   const normalize = (p: string) => p.replace(/\\/g, "/");
-  const matchPkg = (pkg: string, id: string) => normalize(pkg) === normalize(id);
+  const matchRef = (ref: string, id: string) => normalize(ref) === normalize(id);
 
   // Read current settings — global
   const globalPath = join(PI_AGENT, "settings.json");
   const globalSettings = readJson(globalPath);
   let globalPkgs: string[] = [...(globalSettings.packages || [])];
+  let globalSkills: string[] = [...(globalSettings.skills || [])];
   let globalDisabled: string[] = [...(globalSettings._disabledPackages || [])];
 
   // Read current settings — current workspace
   const projPath = join(cwd, ".pi", "settings.json");
   const projSettings = readJson(projPath);
   let projPkgs: string[] = [...(projSettings.packages || [])];
+  let projSkills: string[] = [...(projSettings.skills || [])];
   let projDisabled: string[] = [...(projSettings._disabledPackages || [])];
 
   // Collect all other workspace settings that might be affected
-  const otherWorkspaceSettings: Array<{ cwd: string; path: string; settings: any; pkgs: string[]; disabled: string[] }> = [];
+  const otherWorkspaceSettings: Array<{ cwd: string; path: string; pkgs: string[]; skills: string[]; disabled: string[] }> = [];
   for (const dir of listSessionDirs()) {
     const wsCwd = sessionDirToCwd(dir);
     if (normalize(wsCwd) === normalize(cwd)) continue; // skip current workspace
     const wsPath = join(wsCwd, ".pi", "settings.json");
     const wsSettings = readJson(wsPath);
-    if (!wsSettings.packages && !wsSettings._disabledPackages) continue;
+    if (!wsSettings.packages && !wsSettings.skills && !wsSettings._disabledPackages) continue;
     otherWorkspaceSettings.push({
-      cwd: wsCwd, path: wsPath, settings: wsSettings,
+      cwd: wsCwd, path: wsPath,
       pkgs: [...(wsSettings.packages || [])],
+      skills: [...(wsSettings.skills || [])],
       disabled: [...(wsSettings._disabledPackages || [])],
     });
   }
 
-  // Find which workspace originally owns a package (for "global" state)
-  const findOwner = (id: string): string | null => {
-    for (const ws of otherWorkspaceSettings) {
-      if (ws.pkgs.some(p => matchPkg(p, id))) return ws.cwd;
-    }
-    return null;
-  };
-
   for (const [id, newState] of changes) {
     const resource = resources.find(r => normalize(r.id) === normalize(id));
     const originalState = resource?.state ?? "removed";
+    const isSkill = resource?.type === "skill";
+
+    // Helper: remove id from one scope's appropriate array(s)
+    const removeFromGlobal = () => {
+      if (isSkill) globalSkills = globalSkills.filter(p => !matchRef(p, id));
+      else globalPkgs = globalPkgs.filter(p => !matchRef(p, id));
+      globalDisabled = globalDisabled.filter(p => !matchRef(p, id));
+    };
+    const removeFromProj = () => {
+      if (isSkill) projSkills = projSkills.filter(p => !matchRef(p, id));
+      else projPkgs = projPkgs.filter(p => !matchRef(p, id));
+      projDisabled = projDisabled.filter(p => !matchRef(p, id));
+    };
+    const removeFromAllOtherWs = () => {
+      for (const ws of otherWorkspaceSettings) {
+        if (isSkill) ws.skills = ws.skills.filter(p => !matchRef(p, id));
+        else ws.pkgs = ws.pkgs.filter(p => !matchRef(p, id));
+        ws.disabled = ws.disabled.filter(p => !matchRef(p, id));
+      }
+    };
 
     if (newState === "global") {
-      // Remove from ALL lists everywhere
-      globalPkgs = globalPkgs.filter(p => !matchPkg(p, id));
-      globalDisabled = globalDisabled.filter(p => !matchPkg(p, id));
-      projPkgs = projPkgs.filter(p => !matchPkg(p, id));
-      projDisabled = projDisabled.filter(p => !matchPkg(p, id));
-      for (const ws of otherWorkspaceSettings) {
-        ws.pkgs = ws.pkgs.filter(p => !matchPkg(p, id));
-        ws.disabled = ws.disabled.filter(p => !matchPkg(p, id));
-      }
-      // Add to global
-      globalPkgs.push(id);
+      // Remove from ALL lists everywhere, then add to global
+      removeFromGlobal();
+      removeFromProj();
+      removeFromAllOtherWs();
+      if (isSkill) globalSkills.push(id);
+      else globalPkgs.push(id);
 
     } else if (newState === "workspace") {
       // Remove from global and current workspace only (don't touch other workspaces)
-      globalPkgs = globalPkgs.filter(p => !matchPkg(p, id));
-      globalDisabled = globalDisabled.filter(p => !matchPkg(p, id));
-      projPkgs = projPkgs.filter(p => !matchPkg(p, id));
-      projDisabled = projDisabled.filter(p => !matchPkg(p, id));
-      // Add to current workspace
-      projPkgs.push(id);
+      removeFromGlobal();
+      removeFromProj();
+      if (isSkill) projSkills.push(id);
+      else projPkgs.push(id);
 
     } else {
       // "removed" — only remove from the scope it belongs to
       if (originalState === "global") {
-        // Remove from global
-        globalPkgs = globalPkgs.filter(p => !matchPkg(p, id));
+        removeFromGlobal();
         globalDisabled.push(id);
       } else if (originalState === "workspace") {
-        // Remove from current workspace
-        projPkgs = projPkgs.filter(p => !matchPkg(p, id));
+        removeFromProj();
         projDisabled.push(id);
       } else {
         // Not in any scope — just add to disabled
@@ -464,44 +531,27 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
 
   // Write global settings
   globalSettings.packages = globalPkgs;
+  globalSettings.skills = globalSkills;
   globalSettings._disabledPackages = globalDisabled;
-  // Also sync extensions/skills/themes/prompts overrides with disabled state
-  for (const field of ["extensions", "skills", "themes", "prompts"]) {
-    const entries: string[] = globalSettings[field] || [];
-    const filtered = entries.filter(e => {
-      const resolved = resolve(PI_AGENT, e).replace(/\\/g, "/");
-      return !globalDisabled.some(d => normalize(d) === resolved);
-    });
-    if (filtered.length !== entries.length) globalSettings[field] = filtered;
-  }
   writeJson(globalPath, globalSettings);
 
   // Write current workspace settings (skip system directories)
   const isSystemDir = /^(?:[A-Z]:\\(?:Windows|Program Files|Program Files \(x86\)))\b/i.test(cwd);
   if (!isSystemDir) {
     projSettings.packages = projPkgs;
+    projSettings.skills = projSkills;
     projSettings._disabledPackages = projDisabled;
-    // Also sync extensions/skills/themes/prompts overrides with disabled state
-    const overrideFields = ["extensions", "skills", "themes", "prompts"];
-    for (const field of overrideFields) {
-      const entries: string[] = projSettings[field] || [];
-      const filtered = entries.filter(e => {
-        const resolved = resolve(cwd, e).replace(/\\/g, "/");
-        return !projDisabled.some(d => normalize(d) === resolved);
-      });
-      if (filtered.length !== entries.length) projSettings[field] = filtered;
-    }
     writeJson(projPath, projSettings);
   }
 
   // Write other affected workspace settings
   for (const ws of otherWorkspaceSettings) {
-    // Only write if changed
     const origSettings = readJson(ws.path);
-    const origPkgs = JSON.stringify(origSettings.packages || []);
-    const newPkgs = JSON.stringify(ws.pkgs);
-    if (origPkgs !== newPkgs) {
+    const changed = JSON.stringify(origSettings.packages || []) !== JSON.stringify(ws.pkgs) ||
+                    JSON.stringify(origSettings.skills || []) !== JSON.stringify(ws.skills);
+    if (changed) {
       origSettings.packages = ws.pkgs;
+      origSettings.skills = ws.skills;
       if (ws.disabled.length > 0) origSettings._disabledPackages = ws.disabled;
       writeJson(ws.path, origSettings);
     }
@@ -550,19 +600,78 @@ export default function (pi: ExtensionAPI) {
       messages.push(`Removed ${invalid.length} invalid plugin(s)`);
     }
 
+    // ═══ 1b. Migrate old-style skill entries from packages[] to skills[] ═══
+    // Old workspace-manager versions registered skills as "skills/<name>" in
+    // packages[]. Move them to the skills[] array where they belong.
+    const migrateSettings = (settingsPath: string, label: string) => {
+      const s = readJson(settingsPath);
+      const pkgs: string[] = s.packages || [];
+      const skills: string[] = s.skills || [];
+      const skillEntries = pkgs.filter(p => p.startsWith("skills/") || p.startsWith("skills\\\\"));
+      if (skillEntries.length === 0) return;
+      s.packages = pkgs.filter(p => !skillEntries.includes(p));
+      for (const sk of skillEntries) {
+        if (!skills.includes(sk)) skills.push(sk);
+      }
+      s.skills = skills;
+      writeJson(settingsPath, s);
+      messages.push(`${label}: migrated ${skillEntries.length} skill(s) packages[] → skills[]`);
+    };
+    migrateSettings(join(PI_AGENT, "settings.json"), "Global");
+    migrateSettings(join(cwd, ".pi", "settings.json"), workspaceName(cwd));
+    for (const dir of listSessionDirs()) {
+      const wsCwd = sessionDirToCwd(dir);
+      if (wsCwd === cwd) continue;
+      migrateSettings(join(wsCwd, ".pi", "settings.json"), workspaceName(wsCwd));
+    }
+
     // ═══ 2. Scan ALL workspaces for local resources ═══
-    const RESOURCE_DIRS = ["extensions", "skills", "themes", "prompts"];
     const sessionDirs = listSessionDirs();
     // Include current workspace even if it has no sessions yet
     const allWorkspaceCwds = new Set<string>(sessionDirs.map(d => sessionDirToCwd(d)));
     allWorkspaceCwds.add(cwd);
 
     for (const wsCwd of allWorkspaceCwds) {
-      for (const resType of RESOURCE_DIRS) {
+      // ── Workspace skills: recursive discovery, register to skills[] ──
+      {
+        const wsSkillsDir = join(wsCwd, ".pi", "skills");
+        if (existsSync(wsSkillsDir)) {
+          const skillRels = findSkillDirs(wsSkillsDir); // relative from wsSkillsDir
+          if (skillRels.length > 0) {
+            // Ensure .ignore blocks pi's auto-discover
+            const ignorePath = join(wsSkillsDir, ".ignore");
+            if (!existsSync(ignorePath) || readFileSync(ignorePath, "utf-8").trim() !== "*") {
+              writeFileSync(ignorePath, "*\n", "utf-8");
+              messages.push(`${workspaceName(wsCwd)}: ensured skills/.ignore`);
+            }
+            // Register to workspace's .pi/settings.json skills[]
+            const wsSettingsPath = join(wsCwd, ".pi", "settings.json");
+            const wsSettings = readJson(wsSettingsPath);
+            let wsSkills: string[] = wsSettings.skills || [];
+            const wsDisabled: string[] = wsSettings._disabledPackages || [];
+            const wNorm = (p: string) => p.replace(/\\/g, "/");
+            let added = 0;
+            for (const rel of skillRels) {
+              const skillRef = `skills/${rel}`; // relative to cwd/.pi
+              if (wsSkills.some(p => wNorm(p) === skillRef)) continue;
+              if (wsDisabled.some(d => wNorm(d) === skillRef)) continue;
+              wsSkills.push(skillRef);
+              added++;
+            }
+            if (added > 0) {
+              wsSettings.skills = wsSkills;
+              writeJson(wsSettingsPath, wsSettings);
+              messages.push(`${workspaceName(wsCwd)}: registered ${added} skill(s)`);
+            }
+          }
+        }
+      }
+
+      // ── Workspace packages (extensions/themes/prompts): register to packages[] ──
+      for (const resType of ["extensions", "themes", "prompts"]) {
         const wsResDir = join(wsCwd, ".pi", resType);
         if (!existsSync(wsResDir)) continue;
 
-        // List local resources
         let resFiles: string[] = [];
         try {
           resFiles = readdirSync(wsResDir).filter(f => {
@@ -572,8 +681,6 @@ export default function (pi: ExtensionAPI) {
               if (f.endsWith(".ts") || f.endsWith(".mjs") || f.endsWith(".js")) return true;
               if (statSync(full).isDirectory())
                 return existsSync(join(full, "index.ts")) || existsSync(join(full, "index.js"));
-            } else if (resType === "skills") {
-              return statSync(full).isDirectory() && existsSync(join(full, "SKILL.md"));
             } else if (resType === "themes") {
               return f.endsWith(".js") || f.endsWith(".ts") || statSync(full).isDirectory();
             } else if (resType === "prompts") {
@@ -584,17 +691,12 @@ export default function (pi: ExtensionAPI) {
         } catch { continue; }
         if (resFiles.length === 0) continue;
 
-        // Add/fix .ignore to block auto-discover
         const ignorePath = join(wsResDir, ".ignore");
-        let needIgnore = false;
-        if (!existsSync(ignorePath)) { needIgnore = true; }
-        else { if (readFileSync(ignorePath, "utf-8").trim() !== "*") needIgnore = true; }
-        if (needIgnore) {
+        if (!existsSync(ignorePath) || readFileSync(ignorePath, "utf-8").trim() !== "*") {
           writeFileSync(ignorePath, "*\n", "utf-8");
           messages.push(`${workspaceName(wsCwd)}: ensured ${resType}/.ignore`);
         }
 
-        // Register to workspace's .pi/settings.json
         const wsSettingsPath = join(wsCwd, ".pi", "settings.json");
         const wsSettings = readJson(wsSettingsPath);
         let wsPkgs: string[] = wsSettings.packages || [];
@@ -603,7 +705,6 @@ export default function (pi: ExtensionAPI) {
         let added = 0;
         for (const res of resFiles) {
           const pkgRef = join(wsCwd, ".pi", resType, res).replace(/\\/g, "/");
-          // Check both packages and disabled — skip if already registered or disabled
           if (wsPkgs.some(p => wNorm(p) === pkgRef)) continue;
           if (wsDisabled.some(d => wNorm(d) === pkgRef)) continue;
           wsPkgs.push(pkgRef);
@@ -618,10 +719,62 @@ export default function (pi: ExtensionAPI) {
     }
 
     // ═══ 3. Scan global directories — always register ═══
-    // Unconditionally scan global extensions/skills/themes,
-    // register to settings.json, then create .ignore to prevent
-    // double-loading (auto-discover + packages).
-    for (const resType of ["extensions", "skills", "themes"]) {
+    // Skills → skills[] (recursive discovery, relative paths)
+    // Extensions/themes → packages[] (existing behavior)
+    // .ignore blocks pi's auto-discover so only explicit registration loads.
+
+    // ── Global skills ──
+    {
+      const globalSkillsDir = join(PI_AGENT, "skills");
+      if (existsSync(globalSkillsDir)) {
+        const skillRels = findSkillDirs(globalSkillsDir);
+        if (skillRels.length > 0) {
+          const globalSettingsPath = join(PI_AGENT, "settings.json");
+          const gs = readJson(globalSettingsPath);
+          let gSkills: string[] = gs.skills || [];
+          const gDisabled: string[] = gs._disabledPackages || [];
+          const normalize = (p: string) => p.replace(/\\/g, "/");
+          const isDisabled = (ref: string) => gDisabled.some(d => normalize(d) === normalize(ref));
+          const isInGlobalSkills = (ref: string) => gSkills.some(p => normalize(p) === normalize(ref));
+          // Check if registered as a workspace skill — don't override user's scope choice
+          const isInAnyWorkspaceSkills = (skillRef: string) => {
+            for (const dir of listSessionDirs()) {
+              const wsCwd = sessionDirToCwd(dir);
+              const wsSettings = readJson(join(wsCwd, ".pi", "settings.json"));
+              const wsSkills: string[] = wsSettings.skills || [];
+              if (wsSkills.some(p => normalize(p) === normalize(skillRef))) return true;
+            }
+            const projSettings2 = readJson(join(cwd, ".pi", "settings.json"));
+            const projSkills2: string[] = projSettings2.skills || [];
+            if (projSkills2.some(p => normalize(p) === normalize(skillRef))) return true;
+            return false;
+          };
+          let added = 0;
+          for (const rel of skillRels) {
+            const skillRef = `skills/${rel}`; // relative to agentDir
+            if (isDisabled(skillRef)) continue;
+            if (isInGlobalSkills(skillRef)) continue;
+            if (isInAnyWorkspaceSkills(skillRef)) continue;
+            gSkills.push(skillRef);
+            added++;
+          }
+          if (added > 0) {
+            gs.skills = gSkills;
+            writeJson(globalSettingsPath, gs);
+            messages.push(`Global: registered ${added} skill(s)`);
+          }
+        }
+        // Create/fix .ignore AFTER registration to kill pi's auto-discover
+        const ignorePath = join(globalSkillsDir, ".ignore");
+        if (!existsSync(ignorePath) || readFileSync(ignorePath, "utf-8").trim() !== "*") {
+          writeFileSync(ignorePath, "*\n", "utf-8");
+          messages.push(`Global: ensured skills/.ignore`);
+        }
+      }
+    }
+
+    // ── Global extensions/themes → packages[] ──
+    for (const resType of ["extensions", "themes"]) {
       const globalResDir = join(PI_AGENT, resType);
       if (!existsSync(globalResDir)) continue;
 
@@ -634,8 +787,6 @@ export default function (pi: ExtensionAPI) {
             if (f.endsWith(".ts") || f.endsWith(".mjs") || f.endsWith(".js")) return true;
             if (statSync(full).isDirectory())
               return existsSync(join(full, "index.ts")) || existsSync(join(full, "index.js"));
-          } else if (resType === "skills") {
-            return statSync(full).isDirectory() && existsSync(join(full, "SKILL.md"));
           } else if (resType === "themes") {
             return f.endsWith(".js") || f.endsWith(".ts") || statSync(full).isDirectory();
           }
@@ -651,7 +802,6 @@ export default function (pi: ExtensionAPI) {
       const normalize = (p: string) => p.replace(/\\/g, "/");
       const isDisabled = (ref: string) => gDisabled.some(d => normalize(d) === normalize(ref));
       const isInGlobalPkgs = (ref: string) => gPkgs.some(p => normalize(p) === normalize(ref));
-      // Check if registered in any workspace — don't override user's scope choice
       const isInAnyWorkspace = (pkgRef: string) => {
         for (const dir of listSessionDirs()) {
           const wsCwd = sessionDirToCwd(dir);
@@ -667,9 +817,9 @@ export default function (pi: ExtensionAPI) {
       let added = 0;
       for (const res of resFiles) {
         const pkgRef = `${resType}/${res}`;
-        if (isDisabled(pkgRef)) continue; // removed by user
-        if (isInGlobalPkgs(pkgRef)) continue; // already global
-        if (isInAnyWorkspace(pkgRef)) continue; // user set to workspace — don't steal
+        if (isDisabled(pkgRef)) continue;
+        if (isInGlobalPkgs(pkgRef)) continue;
+        if (isInAnyWorkspace(pkgRef)) continue;
         gPkgs.push(pkgRef);
         added++;
       }
@@ -679,12 +829,8 @@ export default function (pi: ExtensionAPI) {
         messages.push(`Global: registered ${added} ${resType}(s)`);
       }
 
-      // Create/fix .ignore AFTER registration to prevent double-loading
       const ignorePath = join(globalResDir, ".ignore");
-      let needWrite = false;
-      if (!existsSync(ignorePath)) { needWrite = true; }
-      else { if (readFileSync(ignorePath, "utf-8").trim() !== "*") needWrite = true; }
-      if (needWrite) {
+      if (!existsSync(ignorePath) || readFileSync(ignorePath, "utf-8").trim() !== "*") {
         writeFileSync(ignorePath, "*\n", "utf-8");
         messages.push(`Global: ensured ${resType}/.ignore`);
       }
@@ -818,12 +964,13 @@ export default function (pi: ExtensionAPI) {
               const changed = changes.has(r.id) && st !== (r.state ?? "removed");
               const cursor = i === selected ? theme.fg("accent", "→") : " ";
               const mark = changed ? theme.fg("warning", "●") : " ";
-              const nameMax = Math.max(10, currentWidth - 4 - 20);
+              const typeTag = r.type === "skill" ? theme.fg("accent", "S") : theme.fg("dim", "P");
+              const nameMax = Math.max(10, currentWidth - 4 - 22);
               const prefix = r.installed ? "       " : theme.fg("warning", "[MISS] ");
               const nameRaw = r.name;
               const nameStr = nameRaw.length > nameMax ? nameRaw.slice(0, nameMax - 1) + "…" : nameRaw.padEnd(nameMax);
               const stateStr = theme.fg(STATE_COLORS[st], STATE_LABELS[st]);
-              lines.push(` ${cursor} ${mark} ${prefix}${nameStr}${stateStr}`);
+              lines.push(` ${cursor} ${mark} ${prefix}${typeTag} ${nameStr}${stateStr}`);
             }
 
             if (resources.length > maxVisible) {
@@ -832,7 +979,7 @@ export default function (pi: ExtensionAPI) {
           }
           listText.setText(lines.join("\n"));
 
-          helpText.setText(theme.fg("dim", " ↑↓ move  1:Global 2:Workspace 3:Remove  Enter:save  Esc:cancel"));
+          helpText.setText(theme.fg("dim", " S=skill P=pkg | ↑↓ move  1:Global 2:Workspace 3:Remove  Enter:save  Esc:cancel"));
         };
 
         refresh();
@@ -1040,11 +1187,11 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_update",
     label: "Pi Update",
-    description: "Update pi to the latest version. Downloads and installs the update. Run pi_reload after to apply.",
-    promptSnippet: "Update pi to latest version",
+    description: "Update pi and all installed packages to the latest version (--all). Downloads and installs updates. Run pi_reload after to apply.",
+    promptSnippet: "Update pi and all packages to latest",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, _ctx) {
-      const child = spawn("pi", ["update"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
+      const child = spawn("pi", ["update", "--all"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
@@ -1094,10 +1241,10 @@ export default function (pi: ExtensionAPI) {
 
   // Keep /update command as well (non-tool fallback)
   pi.registerCommand("update", {
-    description: "Update pi to the latest version",
+    description: "Update pi and all installed packages (--all)",
     handler: async (_args, ctx) => {
-      ctx.ui.notify("Starting pi update...", "info");
-      const child = spawn("pi", ["update"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
+      ctx.ui.notify("Starting pi update (--all)...", "info");
+      const child = spawn("pi", ["update", "--all"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
       let stdout = "";
       let stderr = "";
       child.stdout.on("data", (d: Buffer) => {
