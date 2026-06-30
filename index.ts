@@ -302,6 +302,38 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
   const globalSettings = readJson(join(PI_AGENT, "settings.json"));
   const projSettings = readJson(join(cwd, ".pi", "settings.json"));
 
+  // ── Auto-cleanup: prune stale references to physically-removed resources ──
+  // A disabled-but-missing entry is stale (the resource was permanently removed outside pi).
+  // Keeping it in _disabledPackages makes the entry reappear in the list forever as "removed",
+  // confusing users who already deleted the files. Prune silently.
+  // Only _disabledPackages is pruned automatically — skills[]/packages[] [MISS] entries are
+  // kept visible so the user can decide via the UI.
+  const installedGit = new Set(listInstalledGitPackages());
+  const checkExists = (ref: string): boolean => {
+    if (ref.startsWith("git:") || ref.startsWith("github:")) return installedGit.has(ref);
+    if (ref.startsWith("npm:")) return true;
+    return existsSync(resolve(PI_AGENT, ref)) || existsSync(resolve(cwd, ref));
+  };
+  let prunedAny = false;
+  for (const settings of [globalSettings, projSettings]) {
+    const disabled = settings._disabledPackages;
+    if (Array.isArray(disabled) && disabled.length > 0) {
+      const filtered = disabled.filter(checkExists);
+      if (filtered.length !== disabled.length) {
+        settings._disabledPackages = filtered;
+        prunedAny = true;
+      }
+    }
+  }
+  if (prunedAny) {
+    try {
+      writeJson(join(PI_AGENT, "settings.json"), globalSettings);
+      const projPath = join(cwd, ".pi", "settings.json");
+      const isSystemDir = /^(?:[A-Z]:\\(?:Windows|Program Files|Program Files \(x86\)))\b/i.test(cwd);
+      if (!isSystemDir && existsSync(projPath)) writeJson(projPath, projSettings);
+    } catch { /* best effort */ }
+  }
+
   // ── Skills channel: skills[] array (relative paths, no resolve) ──
   // Skills are registered as relative paths like "skills/repo/.claude/skills/x"
   // and stored verbatim in settings.skills[]. State is determined by exact
