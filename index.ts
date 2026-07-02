@@ -147,9 +147,10 @@ function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   // Build launch commands in priority order
   const commands: [string, string[]][] = [];
   if (existsSync(ALACRITTY)) {
-    commands.push([ALACRITTY, ["--working-directory", cwd, "-e", piCmd, "--session", sessionFile]]);
+    // Alacritty -e takes a single command string, not args array
+    commands.push(["cmd.exe", ["/c", `start "" "${ALACRITTY}" --working-directory "${cwd}" -e "${piCmd}" --session "${sessionFile}"`]]);
   }
-  commands.push(["wt.exe", ["-d", cwd, "--", piCmd, "--session", sessionFile]]);
+  commands.push(["cmd.exe", ["/c", `start "" "${WT}" -d "${cwd}" -- "${piCmd}" --session "${sessionFile}"`]]);
   commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
   if (process.platform === "win32") {
