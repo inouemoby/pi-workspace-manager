@@ -141,7 +141,7 @@ function launchTerminal(cwd: string, sessionFile?: string): boolean {
  */
 function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
   const piCmd = process.platform === "win32"
-    ? execSync("where pi.cmd").toString().trim().split("\n")[0].replace(/\\/g, "/")
+    ? execSync("where pi.cmd").toString().trim().split("\n")[0]
     : "pi";
 
   // Build launch commands in priority order
