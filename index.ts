@@ -140,15 +140,17 @@ function launchTerminal(cwd: string, sessionFile?: string): boolean {
  * Uses same Alacritty → WT → cmd fallback as launchTerminal.
  */
 function launchTerminalDetached(cwd: string, sessionFile: string): boolean {
-  const piCmd = `"${PI_CMD}" --session "${sessionFile}"`;
+  const piCmd = process.platform === "win32"
+    ? execSync("where pi.cmd").toString().trim().split("\n")[0].replace(/\\/g, "/")
+    : "pi";
 
   // Build launch commands in priority order
   const commands: [string, string[]][] = [];
   if (existsSync(ALACRITTY)) {
-    commands.push(["cmd.exe", ["/c", `start "" "${ALACRITTY}" --working-directory "${cwd}" -e ${piCmd}`]]);
+    commands.push([ALACRITTY, ["--working-directory", cwd, "-e", piCmd, "--session", sessionFile]]);
   }
-  commands.push(["cmd.exe", ["/c", `start "" "${WT}" -d "${cwd}" -- ${piCmd}`]]);
-  commands.push(["cmd.exe", ["/c", `start "" "${CMD}" /k "cd /d "${cwd}" && ${piCmd}"`]]);
+  commands.push(["wt.exe", ["-d", cwd, "--", piCmd, "--session", sessionFile]]);
+  commands.push(["cmd.exe", ["/c", `cd /d "${cwd}" && "${piCmd}" --session "${sessionFile}"`]]);
 
   if (process.platform === "win32") {
     // On Windows: save foreground window, launch terminal, then restore focus
