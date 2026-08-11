@@ -108,7 +108,7 @@ Allows the model to trigger pi's native context compaction when all of these con
 
 The tool checks its enabled state and context percentage itself and refuses premature calls, calls with unavailable usage, or calls while another compaction is running. Configured transient failures are retried before the tool gives up. After successful compaction it automatically sends a user message instructing pi to continue the unfinished task from the compacted context.
 
-`pi_compact` runs sequentially and terminates its current tool turn because native compaction aborts the active agent operation before summarizing history.
+`pi_compact` runs sequentially and terminates its current tool turn. It then waits for pi's native post-turn automatic compaction. If automatic compaction occurs, the tool accepts it and continues the task without starting a duplicate manual compaction. Manual `ctx.compact()` is used only as a fallback after `agent_settled` when no automatic compaction occurred. This avoids the automatic/manual race that otherwise produces `Already compacted`.
 
 ## Design Notes
 

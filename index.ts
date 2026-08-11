@@ -7,7 +7,7 @@
  * 4. Guarded model-triggered context compaction with automatic task continuation
  */
 
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   Container, type SelectItem, SelectList,
@@ -43,6 +43,13 @@ interface WorkspaceManagerConfig {
     maxRetries: number;
     retryDelayMs: number;
   };
+}
+
+interface PendingCompactRequest {
+  unfinishedTask: string;
+  config: WorkspaceManagerConfig["compact"];
+  compactionObserved: boolean;
+  manualStarted: boolean;
 }
 
 const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
@@ -671,6 +678,7 @@ export default function (pi: ExtensionAPI) {
   let managerConfig = loadManagerConfig();
   let sessionActive = false;
   let compactInProgress = false;
+  let pendingCompactRequest: PendingCompactRequest | undefined;
   let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   const applyManagedToolAvailability = () => {
@@ -686,6 +694,94 @@ export default function (pi: ExtensionAPI) {
     saveManagerConfig(managerConfig);
     applyManagedToolAvailability();
   };
+
+  const clearPendingCompaction = (request: PendingCompactRequest): boolean => {
+    if (pendingCompactRequest !== request) return false;
+    if (compactRetryTimer) clearTimeout(compactRetryTimer);
+    compactRetryTimer = undefined;
+    pendingCompactRequest = undefined;
+    compactInProgress = false;
+    return true;
+  };
+
+  const continueAfterCompaction = (request: PendingCompactRequest, ctx: ExtensionContext) => {
+    if (!clearPendingCompaction(request) || !sessionActive) return;
+    if (ctx.hasUI) ctx.ui.notify("Context compaction completed. Continuing task...", "info");
+    try {
+      pi.sendUserMessage(`上下文压缩已完成。请根据压缩后的上下文继续执行尚未完成的任务：${request.unfinishedTask}`);
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    }
+  };
+
+  const runManualCompaction = (request: PendingCompactRequest, ctx: ExtensionContext, attempt: number) => {
+    const customInstructions = [
+      "The current task is unfinished. Preserve everything required to resume it accurately after compaction.",
+      `Unfinished task and next step: ${request.unfinishedTask}`,
+      "Retain the user's original requirements and constraints, completed and pending work, key decisions, exact file paths and edits, errors, verification results, and concrete next steps.",
+    ].join("\n");
+
+    ctx.compact({
+      customInstructions,
+      onComplete: () => continueAfterCompaction(request, ctx),
+      onError: (error) => {
+        // Another compaction may have completed between the settled-state check
+        // and this manual attempt. Treat that as success rather than surfacing a
+        // second extension error or retrying an already-compacted session.
+        if (/already compacted/i.test(error.message)) {
+          continueAfterCompaction(request, ctx);
+          return;
+        }
+
+        const retriesUsed = attempt - 1;
+        const retryable = !/(cancelled|canceled|nothing to compact)/i.test(error.message);
+        const shouldRetry = sessionActive
+          && request.config.retryOnFailure
+          && retriesUsed < request.config.maxRetries
+          && retryable;
+        if (shouldRetry) {
+          const retryNumber = retriesUsed + 1;
+          if (ctx.hasUI) {
+            ctx.ui.notify(
+              `Compaction failed: ${error.message}. Retry ${retryNumber}/${request.config.maxRetries} in ${request.config.retryDelayMs}ms...`,
+              "warning",
+            );
+          }
+          compactRetryTimer = setTimeout(() => {
+            compactRetryTimer = undefined;
+            if (!sessionActive || pendingCompactRequest !== request) return;
+            runManualCompaction(request, ctx, attempt + 1);
+          }, request.config.retryDelayMs);
+          return;
+        }
+
+        if (!clearPendingCompaction(request)) return;
+        if (ctx.hasUI) ctx.ui.notify(`Context compaction failed: ${error.message}`, "error");
+      },
+    });
+  };
+
+  // A model tool call ends its current turn first. Pi may then perform native
+  // threshold/overflow compaction. Observe that result and only start manual
+  // compaction after the agent is fully settled when no native compaction ran.
+  pi.on("session_compact", () => {
+    if (pendingCompactRequest) pendingCompactRequest.compactionObserved = true;
+  });
+
+  pi.on("agent_settled", (_event, ctx) => {
+    const request = pendingCompactRequest;
+    if (!request || request.manualStarted) return;
+    if (request.compactionObserved) {
+      continueAfterCompaction(request, ctx);
+      return;
+    }
+
+    request.manualStarted = true;
+    if (ctx.hasUI) ctx.ui.notify("No automatic compaction ran. Starting manual compaction...", "warning");
+    runManualCompaction(request, ctx, 1);
+  });
 
   pi.on("before_agent_start", (event) => {
     if (!managerConfig.compact.enabled) return;
@@ -1537,75 +1633,26 @@ export default function (pi: ExtensionAPI) {
       }
 
       compactInProgress = true;
+      pendingCompactRequest = {
+        unfinishedTask,
+        config: compactConfig,
+        compactionObserved: false,
+        manualStarted: false,
+      };
       if (ctx.hasUI) {
-        ctx.ui.notify(`Context at ${usage.percent.toFixed(1)}%. Compacting history...`, "warning");
+        ctx.ui.notify(
+          `Context at ${usage.percent.toFixed(1)}%. Waiting for pi's automatic compaction before using the manual fallback...`,
+          "warning",
+        );
       }
-
-      const customInstructions = [
-        "The current task is unfinished. Preserve everything required to resume it accurately after compaction.",
-        `Unfinished task and next step: ${unfinishedTask}`,
-        "Retain the user's original requirements and constraints, completed and pending work, key decisions, exact file paths and edits, errors, verification results, and concrete next steps.",
-      ].join("\n");
-
-      const isRetryable = (error: Error) => {
-        return !/(cancelled|canceled|already compacted|nothing to compact)/i.test(error.message);
-      };
-
-      const runCompactionAttempt = (attempt: number) => {
-        ctx.compact({
-          customInstructions,
-          onComplete: () => {
-            compactInProgress = false;
-            if (compactRetryTimer) clearTimeout(compactRetryTimer);
-            compactRetryTimer = undefined;
-            if (!sessionActive) return;
-            if (ctx.hasUI) ctx.ui.notify("Context compaction completed. Continuing task...", "info");
-            try {
-              pi.sendUserMessage(`上下文压缩已完成。请根据压缩后的上下文继续执行尚未完成的任务：${unfinishedTask}`);
-            } catch (error) {
-              if (ctx.hasUI) {
-                ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
-              }
-            }
-          },
-          onError: (error) => {
-            const retriesUsed = attempt - 1;
-            const shouldRetry = sessionActive
-              && compactConfig.retryOnFailure
-              && retriesUsed < compactConfig.maxRetries
-              && isRetryable(error);
-            if (shouldRetry) {
-              const retryNumber = retriesUsed + 1;
-              if (ctx.hasUI) {
-                ctx.ui.notify(
-                  `Compaction failed: ${error.message}. Retry ${retryNumber}/${compactConfig.maxRetries} in ${compactConfig.retryDelayMs}ms...`,
-                  "warning",
-                );
-              }
-              compactRetryTimer = setTimeout(() => {
-                compactRetryTimer = undefined;
-                if (!sessionActive || !compactInProgress) return;
-                runCompactionAttempt(attempt + 1);
-              }, compactConfig.retryDelayMs);
-              return;
-            }
-
-            compactInProgress = false;
-            compactRetryTimer = undefined;
-            if (ctx.hasUI) ctx.ui.notify(`Context compaction failed: ${error.message}`, "error");
-          },
-        });
-      };
-
-      runCompactionAttempt(1);
 
       return {
         content: [{
           type: "text",
-          text: `Context usage is ${usage.percent.toFixed(1)}%. Compaction started; after it completes, an automatic user message will resume the unfinished task.`,
+          text: `Context usage is ${usage.percent.toFixed(1)}%. Compaction has been queued. Pi's automatic compaction gets priority; a manual fallback runs only if no automatic compaction occurs. The task will resume automatically afterward.`,
         }],
         details: {
-          status: "started",
+          status: "queued",
           tokens: usage.tokens,
           contextWindow: usage.contextWindow,
           percent: usage.percent,
@@ -1626,7 +1673,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Checking context..."), 0, 0);
       const status = (result.details as { status?: string } | undefined)?.status;
-      if (status === "started") return new Text(theme.fg("success", "✓ Compaction started"), 0, 0);
+      if (status === "queued") return new Text(theme.fg("success", "✓ Compaction queued"), 0, 0);
       if (status === "already-in-progress") return new Text(theme.fg("warning", "Compaction already running"), 0, 0);
       return new Text(theme.fg("warning", "Compaction not needed"), 0, 0);
     },
@@ -1700,6 +1747,7 @@ export default function (pi: ExtensionAPI) {
     sessionActive = false;
     if (compactRetryTimer) clearTimeout(compactRetryTimer);
     compactRetryTimer = undefined;
+    pendingCompactRequest = undefined;
     compactInProgress = false;
   });
 
