@@ -1,7 +1,7 @@
 {
   "name": "pi-workspace-manager",
-  "version": "1.0.0",
-  "description": "Cross-workspace session browsing, unified plugin management panel, and startup validation for pi coding agent.",
+  "version": "1.2.0",
+  "description": "Workspace session browsing, plugin management, startup validation, and guarded model-triggered compaction for pi coding agent.",
   "keywords": [
     "pi-package"
   ],

@@ -4,12 +4,16 @@
  * 1. Cross-workspace session browsing & launching via Alacritty
  * 2. Unified plugin management panel with custom TUI (/plugins)
  * 3. Startup validation — auto-remove invalid local-dev plugins
+ * 4. Guarded model-triggered context compaction with automatic task continuation
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { Container, type SelectItem, SelectList, Text, matchesKey } from "@earendil-works/pi-tui";
-import { DynamicBorder } from "@earendil-works/pi-coding-agent";
+import {
+  Container, type SelectItem, SelectList,
+  type SettingItem, SettingsList, Text, matchesKey,
+} from "@earendil-works/pi-tui";
+import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { basename, dirname, join, resolve } from "node:path";
 import {
   existsSync, readFileSync, writeFileSync,
@@ -26,6 +30,31 @@ const PI_CMD = join(HOME, "AppData", "Roaming", "npm", "pi.cmd");
 const ALACRITTY = "C:\\Program Files\\Alacritty\\alacritty.exe";
 const WT = "wt.exe";
 const CMD = "cmd.exe";
+const MANAGER_CONFIG_KEY = "pi-workspace-manager";
+
+interface WorkspaceManagerConfig {
+  reload: {
+    enabled: boolean;
+  };
+  compact: {
+    enabled: boolean;
+    thresholdPercent: number;
+    retryOnFailure: boolean;
+    maxRetries: number;
+    retryDelayMs: number;
+  };
+}
+
+const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
+  reload: { enabled: true },
+  compact: {
+    enabled: true,
+    thresholdPercent: 95,
+    retryOnFailure: true,
+    maxRetries: 2,
+    retryDelayMs: 2000,
+  },
+};
 
 // ─── Helpers ────────────────────────────────────────────────
 
@@ -38,6 +67,40 @@ function writeJson(p: string, data: any) {
   const dir = dirname(p);
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   writeFileSync(p, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function boundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const parsed = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function loadManagerConfig(): WorkspaceManagerConfig {
+  const settings = readJson(join(PI_AGENT, "settings.json"));
+  const raw = settings[MANAGER_CONFIG_KEY] ?? {};
+  const rawReload = raw.reload ?? {};
+  const rawCompact = raw.compact ?? {};
+  return {
+    reload: {
+      enabled: typeof rawReload.enabled === "boolean" ? rawReload.enabled : DEFAULT_MANAGER_CONFIG.reload.enabled,
+    },
+    compact: {
+      enabled: typeof rawCompact.enabled === "boolean" ? rawCompact.enabled : DEFAULT_MANAGER_CONFIG.compact.enabled,
+      thresholdPercent: boundedInteger(rawCompact.thresholdPercent, DEFAULT_MANAGER_CONFIG.compact.thresholdPercent, 50, 99),
+      retryOnFailure: typeof rawCompact.retryOnFailure === "boolean"
+        ? rawCompact.retryOnFailure
+        : DEFAULT_MANAGER_CONFIG.compact.retryOnFailure,
+      maxRetries: boundedInteger(rawCompact.maxRetries, DEFAULT_MANAGER_CONFIG.compact.maxRetries, 0, 10),
+      retryDelayMs: boundedInteger(rawCompact.retryDelayMs, DEFAULT_MANAGER_CONFIG.compact.retryDelayMs, 250, 30000),
+    },
+  };
+}
+
+function saveManagerConfig(config: WorkspaceManagerConfig): void {
+  const settingsPath = join(PI_AGENT, "settings.json");
+  const settings = readJson(settingsPath);
+  settings[MANAGER_CONFIG_KEY] = config;
+  writeJson(settingsPath, settings);
 }
 
 function sessionDirToCwd(dir: string): string {
@@ -605,12 +668,44 @@ const STATE_COLORS: Record<ResourceState, string> = {
 };
 
 export default function (pi: ExtensionAPI) {
+  let managerConfig = loadManagerConfig();
+  let sessionActive = false;
+  let compactInProgress = false;
+  let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  const applyManagedToolAvailability = () => {
+    const active = new Set(pi.getActiveTools());
+    if (managerConfig.reload.enabled) active.add("pi_reload");
+    else active.delete("pi_reload");
+    if (managerConfig.compact.enabled) active.add("pi_compact");
+    else active.delete("pi_compact");
+    pi.setActiveTools([...active]);
+  };
+
+  const persistManagerConfig = () => {
+    saveManagerConfig(managerConfig);
+    applyManagedToolAvailability();
+  };
+
+  pi.on("before_agent_start", (event) => {
+    if (!managerConfig.compact.enabled) return;
+    const retryNote = managerConfig.compact.retryOnFailure
+      ? `Transient failures may be retried up to ${managerConfig.compact.maxRetries} time(s).`
+      : "Failure retry is disabled.";
+    return {
+      systemPrompt: `${event.systemPrompt}\n\nRuntime pi_compact setting: the task must be unfinished and context usage must be strictly above ${managerConfig.compact.thresholdPercent}% before calling the tool. ${retryNote}`,
+    };
+  });
 
   // ═══════════════════════════════════════════════════════════
   // 0. STARTUP VALIDATION
   // ═══════════════════════════════════════════════════════════
 
   pi.on("session_start", async (_event, ctx) => {
+    sessionActive = true;
+    managerConfig = loadManagerConfig();
+    applyManagedToolAvailability();
+
     const cwd = ctx.cwd;
     const messages: string[] = [];
 
@@ -1070,7 +1165,163 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // 3. WORKSPACE SESSION TOOL
+  // 3. WORKSPACE MANAGER SETTINGS UI
+  // ═══════════════════════════════════════════════════════════
+
+  pi.registerCommand("wm-settings", {
+    description: "Manage pi_reload and pi_compact tool settings",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/wm-settings requires TUI mode", "error");
+        return;
+      }
+
+      const chooseSection = async (): Promise<string | null> => {
+        const retrySummary = managerConfig.compact.retryOnFailure
+          ? `${managerConfig.compact.maxRetries} retries / ${managerConfig.compact.retryDelayMs}ms`
+          : "retry off";
+        const items: SelectItem[] = [
+          {
+            value: "reload",
+            label: "Reload tool",
+            description: managerConfig.reload.enabled ? "pi_reload enabled" : "pi_reload disabled",
+          },
+          {
+            value: "compact",
+            label: "Compact tool",
+            description: `${managerConfig.compact.enabled ? "enabled" : "disabled"} · threshold >${managerConfig.compact.thresholdPercent}% · ${retrySummary}`,
+          },
+          { value: "done", label: "Done", description: "Close workspace manager settings" },
+        ];
+
+        return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
+          const container = new Container();
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          container.addChild(new Text(theme.fg("accent", theme.bold(" Workspace Manager Settings")), 1, 0));
+          const list = new SelectList(items, items.length + 1, {
+            selectedPrefix: (s) => theme.fg("accent", s),
+            selectedText: (s) => theme.fg("accent", s),
+            description: (s) => theme.fg("muted", s),
+            scrollInfo: (s) => theme.fg("dim", s),
+          });
+          list.onSelect = (item) => done(item.value);
+          list.onCancel = () => done(null);
+          container.addChild(list);
+          container.addChild(new Text(theme.fg("dim", " ↑↓ navigate · enter open · esc close"), 1, 0));
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          return {
+            render: (width) => container.render(width),
+            invalidate: () => container.invalidate(),
+            handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
+          };
+        });
+      };
+
+      const showSettings = async (
+        title: string,
+        items: SettingItem[],
+        onChange: (id: string, value: string) => void,
+      ): Promise<void> => {
+        await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+          const container = new Container();
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          container.addChild(new Text(theme.fg("accent", theme.bold(` ${title}`)), 1, 0));
+          const list = new SettingsList(
+            items,
+            Math.min(items.length + 2, 12),
+            getSettingsListTheme(),
+            (id, value) => {
+              onChange(id, value);
+              persistManagerConfig();
+              ctx.ui.notify(`${title}: ${id} = ${value}`, "info");
+              tui.requestRender();
+            },
+            () => done(undefined),
+          );
+          container.addChild(list);
+          container.addChild(new Text(theme.fg("dim", " ↑↓ select · enter/space change · esc back"), 1, 0));
+          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+          return {
+            render: (width) => container.render(width),
+            invalidate: () => container.invalidate(),
+            handleInput: (data) => { list.handleInput?.(data); tui.requestRender(); },
+          };
+        });
+      };
+
+      while (true) {
+        const section = await chooseSection();
+        if (!section || section === "done") return;
+
+        if (section === "reload") {
+          await showSettings(
+            "Reload Tool Settings",
+            [{
+              id: "enabled",
+              label: "Model-callable pi_reload",
+              currentValue: managerConfig.reload.enabled ? "enabled" : "disabled",
+              values: ["enabled", "disabled"],
+            }],
+            (_id, value) => {
+              managerConfig.reload.enabled = value === "enabled";
+            },
+          );
+          continue;
+        }
+
+        const thresholdValues = Array.from({ length: 50 }, (_, i) => `${i + 50}%`);
+        const retryDelayValues = [...new Set([
+          250, 500, 1000, 2000, 3000, 5000, 10000, 30000,
+          managerConfig.compact.retryDelayMs,
+        ])].sort((a, b) => a - b).map(String);
+        await showSettings(
+          "Compact Tool Settings",
+          [
+            {
+              id: "enabled",
+              label: "Model-callable pi_compact",
+              currentValue: managerConfig.compact.enabled ? "enabled" : "disabled",
+              values: ["enabled", "disabled"],
+            },
+            {
+              id: "thresholdPercent",
+              label: "Compact when context exceeds",
+              currentValue: `${managerConfig.compact.thresholdPercent}%`,
+              values: thresholdValues,
+            },
+            {
+              id: "retryOnFailure",
+              label: "Retry transient failures",
+              currentValue: managerConfig.compact.retryOnFailure ? "enabled" : "disabled",
+              values: ["enabled", "disabled"],
+            },
+            {
+              id: "maxRetries",
+              label: "Maximum retries after first attempt",
+              currentValue: String(managerConfig.compact.maxRetries),
+              values: Array.from({ length: 11 }, (_, i) => String(i)),
+            },
+            {
+              id: "retryDelayMs",
+              label: "Retry delay (milliseconds)",
+              currentValue: String(managerConfig.compact.retryDelayMs),
+              values: retryDelayValues,
+            },
+          ],
+          (id, value) => {
+            if (id === "enabled") managerConfig.compact.enabled = value === "enabled";
+            else if (id === "thresholdPercent") managerConfig.compact.thresholdPercent = Number.parseInt(value, 10);
+            else if (id === "retryOnFailure") managerConfig.compact.retryOnFailure = value === "enabled";
+            else if (id === "maxRetries") managerConfig.compact.maxRetries = Number.parseInt(value, 10);
+            else if (id === "retryDelayMs") managerConfig.compact.retryDelayMs = Number.parseInt(value, 10);
+          },
+        );
+      }
+    },
+  });
+
+  // ═══════════════════════════════════════════════════════════
+  // 4. WORKSPACE SESSION TOOL
   // ═══════════════════════════════════════════════════════════
 
   pi.registerTool({
@@ -1213,8 +1464,173 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // 6. Tools — pi_update and pi_reload
+  // 6. Tools — pi_compact, pi_update, and pi_reload
   // ═══════════════════════════════════════════════════════════
+
+  // Model-triggered compaction is deliberately guarded. The model may decide
+  // whether its task is unfinished, but the extension independently enforces
+  // the configured context threshold before allowing compaction.
+  pi.registerTool({
+    name: "pi_compact",
+    label: "Pi Compact",
+    description: "Compact older conversation history so an unfinished task can continue. Use only when the current task is not finished AND context usage is strictly above the configured threshold (default 95%). The tool checks its enabled state and threshold, optionally retries transient failures, and automatically resumes the task after success.",
+    promptSnippet: "Compact history only when an unfinished task must continue and context usage exceeds the configured threshold",
+    promptGuidelines: [
+      "Use pi_compact only when the current task is still unfinished and context usage is strictly above its configured threshold (default 95%); never use pi_compact for routine cleanup or after the task is complete.",
+      "When pi_compact is necessary, describe the remaining work precisely in unfinishedTask so compaction preserves it and the automatic continuation message resumes the correct work.",
+    ],
+    parameters: Type.Object({
+      unfinishedTask: Type.String({
+        minLength: 1,
+        description: "Concise description of the unfinished task, current progress, and immediate next step to resume after compaction.",
+      }),
+    }),
+    executionMode: "sequential",
+    async execute(_id, params, _signal, _onUpdate, ctx) {
+      const compactConfig = { ...managerConfig.compact };
+      if (!compactConfig.enabled) {
+        return {
+          content: [{ type: "text", text: "Compaction refused: pi_compact is disabled in /wm-settings." }],
+          details: { status: "disabled" },
+        };
+      }
+
+      if (compactInProgress) {
+        return {
+          content: [{ type: "text", text: "Compaction is already in progress. Do not request another one." }],
+          details: { status: "already-in-progress" },
+          terminate: true,
+        };
+      }
+
+      const usage = ctx.getContextUsage();
+      if (!usage || usage.percent === null || usage.tokens === null) {
+        return {
+          content: [{ type: "text", text: `Compaction refused: current context usage is unavailable. Continue without compacting unless a later call reports usage above the configured ${compactConfig.thresholdPercent}% threshold.` }],
+          details: { status: "refused", reason: "usage-unavailable", thresholdPercent: compactConfig.thresholdPercent },
+        };
+      }
+
+      if (usage.percent <= compactConfig.thresholdPercent) {
+        return {
+          content: [{
+            type: "text",
+            text: `Compaction refused: context usage is ${usage.percent.toFixed(1)}%, which has not exceeded the configured ${compactConfig.thresholdPercent}% threshold. Continue the task without compacting.`,
+          }],
+          details: {
+            status: "refused",
+            reason: "below-threshold",
+            tokens: usage.tokens,
+            contextWindow: usage.contextWindow,
+            percent: usage.percent,
+            thresholdPercent: compactConfig.thresholdPercent,
+          },
+        };
+      }
+
+      const unfinishedTask = params.unfinishedTask.trim();
+      if (!unfinishedTask) {
+        return {
+          content: [{ type: "text", text: "Compaction refused: unfinishedTask must describe the work that remains." }],
+          details: { status: "refused", reason: "missing-unfinished-task" },
+        };
+      }
+
+      compactInProgress = true;
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Context at ${usage.percent.toFixed(1)}%. Compacting history...`, "warning");
+      }
+
+      const customInstructions = [
+        "The current task is unfinished. Preserve everything required to resume it accurately after compaction.",
+        `Unfinished task and next step: ${unfinishedTask}`,
+        "Retain the user's original requirements and constraints, completed and pending work, key decisions, exact file paths and edits, errors, verification results, and concrete next steps.",
+      ].join("\n");
+
+      const isRetryable = (error: Error) => {
+        return !/(cancelled|canceled|already compacted|nothing to compact)/i.test(error.message);
+      };
+
+      const runCompactionAttempt = (attempt: number) => {
+        ctx.compact({
+          customInstructions,
+          onComplete: () => {
+            compactInProgress = false;
+            if (compactRetryTimer) clearTimeout(compactRetryTimer);
+            compactRetryTimer = undefined;
+            if (!sessionActive) return;
+            if (ctx.hasUI) ctx.ui.notify("Context compaction completed. Continuing task...", "info");
+            try {
+              pi.sendUserMessage(`上下文压缩已完成。请根据压缩后的上下文继续执行尚未完成的任务：${unfinishedTask}`);
+            } catch (error) {
+              if (ctx.hasUI) {
+                ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
+              }
+            }
+          },
+          onError: (error) => {
+            const retriesUsed = attempt - 1;
+            const shouldRetry = sessionActive
+              && compactConfig.retryOnFailure
+              && retriesUsed < compactConfig.maxRetries
+              && isRetryable(error);
+            if (shouldRetry) {
+              const retryNumber = retriesUsed + 1;
+              if (ctx.hasUI) {
+                ctx.ui.notify(
+                  `Compaction failed: ${error.message}. Retry ${retryNumber}/${compactConfig.maxRetries} in ${compactConfig.retryDelayMs}ms...`,
+                  "warning",
+                );
+              }
+              compactRetryTimer = setTimeout(() => {
+                compactRetryTimer = undefined;
+                if (!sessionActive || !compactInProgress) return;
+                runCompactionAttempt(attempt + 1);
+              }, compactConfig.retryDelayMs);
+              return;
+            }
+
+            compactInProgress = false;
+            compactRetryTimer = undefined;
+            if (ctx.hasUI) ctx.ui.notify(`Context compaction failed: ${error.message}`, "error");
+          },
+        });
+      };
+
+      runCompactionAttempt(1);
+
+      return {
+        content: [{
+          type: "text",
+          text: `Context usage is ${usage.percent.toFixed(1)}%. Compaction started; after it completes, an automatic user message will resume the unfinished task.`,
+        }],
+        details: {
+          status: "started",
+          tokens: usage.tokens,
+          contextWindow: usage.contextWindow,
+          percent: usage.percent,
+          thresholdPercent: compactConfig.thresholdPercent,
+          retryOnFailure: compactConfig.retryOnFailure,
+          maxRetries: compactConfig.maxRetries,
+          retryDelayMs: compactConfig.retryDelayMs,
+          unfinishedTask,
+        },
+        terminate: true,
+      };
+    },
+    renderCall(args, theme) {
+      const rawTask = args.unfinishedTask ?? "";
+      const task = rawTask.length > 60 ? `${rawTask.slice(0, 59)}…` : rawTask;
+      return new Text(theme.fg("toolTitle", theme.bold("pi_compact ")) + theme.fg("dim", task || "preparing..."), 0, 0);
+    },
+    renderResult(result, { isPartial }, theme) {
+      if (isPartial) return new Text(theme.fg("warning", "Checking context..."), 0, 0);
+      const status = (result.details as { status?: string } | undefined)?.status;
+      if (status === "started") return new Text(theme.fg("success", "✓ Compaction started"), 0, 0);
+      if (status === "already-in-progress") return new Text(theme.fg("warning", "Compaction already running"), 0, 0);
+      return new Text(theme.fg("warning", "Compaction not needed"), 0, 0);
+    },
+  });
 
   pi.registerTool({
     name: "pi_update",
@@ -1252,6 +1668,13 @@ export default function (pi: ExtensionAPI) {
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
+      if (!managerConfig.reload.enabled) {
+        return {
+          content: [{ type: "text", text: "Reload refused: pi_reload is disabled in /wm-settings." }],
+          details: { status: "disabled" },
+        };
+      }
+
       const sessionFile = ctx.sessionManager.sessionFile;
       const cwd = ctx.cwd;
       fs.writeFileSync(resumeFlagPath, JSON.stringify({
@@ -1267,8 +1690,17 @@ export default function (pi: ExtensionAPI) {
     },
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Restarting..."), 0, 0);
+      const status = (result.details as { status?: string } | undefined)?.status;
+      if (status === "disabled") return new Text(theme.fg("warning", "Reload disabled"), 0, 0);
       return new Text(theme.fg("success", "\u2713 Restarted"), 0, 0);
     },
+  });
+
+  pi.on("session_shutdown", () => {
+    sessionActive = false;
+    if (compactRetryTimer) clearTimeout(compactRetryTimer);
+    compactRetryTimer = undefined;
+    compactInProgress = false;
   });
 
   // Keep /update command as well (non-tool fallback)
