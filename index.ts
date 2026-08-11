@@ -42,6 +42,7 @@ interface WorkspaceManagerConfig {
     retryOnFailure: boolean;
     maxRetries: number;
     retryDelayMs: number;
+    resumeAfterForcedAutoCompact: boolean;
   };
 }
 
@@ -52,6 +53,14 @@ interface PendingCompactRequest {
   manualStarted: boolean;
 }
 
+interface ForcedAutoCompactResume {
+  reason: "threshold" | "overflow";
+  percent: number | null;
+  willRetry: boolean;
+  previousTask: string;
+  compactionObserved: boolean;
+}
+
 const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
   reload: { enabled: true },
   compact: {
@@ -60,6 +69,7 @@ const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
     retryOnFailure: true,
     maxRetries: 2,
     retryDelayMs: 2000,
+    resumeAfterForcedAutoCompact: true,
   },
 };
 
@@ -99,6 +109,9 @@ function loadManagerConfig(): WorkspaceManagerConfig {
         : DEFAULT_MANAGER_CONFIG.compact.retryOnFailure,
       maxRetries: boundedInteger(rawCompact.maxRetries, DEFAULT_MANAGER_CONFIG.compact.maxRetries, 0, 10),
       retryDelayMs: boundedInteger(rawCompact.retryDelayMs, DEFAULT_MANAGER_CONFIG.compact.retryDelayMs, 250, 30000),
+      resumeAfterForcedAutoCompact: typeof rawCompact.resumeAfterForcedAutoCompact === "boolean"
+        ? rawCompact.resumeAfterForcedAutoCompact
+        : DEFAULT_MANAGER_CONFIG.compact.resumeAfterForcedAutoCompact,
     },
   };
 }
@@ -171,6 +184,29 @@ function getFirstMessage(file: string): string {
       } catch { /* */ }
     }
   } catch { /* */ }
+  return "";
+}
+
+function getMessageText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.map((part) => {
+    if (typeof part === "string") return part;
+    if (part && typeof part === "object" && "type" in part && "text" in part && part.type === "text") {
+      return typeof part.text === "string" ? part.text : "";
+    }
+    return "";
+  }).filter(Boolean).join("\n");
+}
+
+function getLatestUserTask(entries: readonly any[]): string {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+    const text = getMessageText(entry.message.content).trim();
+    if (!text) continue;
+    return text.length > 1200 ? `${text.slice(0, 1199)}…` : text;
+  }
   return "";
 }
 
@@ -679,6 +715,7 @@ export default function (pi: ExtensionAPI) {
   let sessionActive = false;
   let compactInProgress = false;
   let pendingCompactRequest: PendingCompactRequest | undefined;
+  let forcedAutoCompactResume: ForcedAutoCompactResume | undefined;
   let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
 
   const applyManagedToolAvailability = () => {
@@ -712,6 +749,34 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       if (ctx.hasUI) {
         ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
+      }
+    }
+  };
+
+  const continueAfterForcedAutoCompaction = (request: ForcedAutoCompactResume, ctx: ExtensionContext) => {
+    if (forcedAutoCompactResume !== request) return;
+    forcedAutoCompactResume = undefined;
+    if (!sessionActive) return;
+
+    const percentText = request.percent === null ? "unknown usage" : `${request.percent.toFixed(1)}% context usage`;
+    const retryText = request.willRetry
+      ? "Pi has already completed its automatic compact-and-retry flow."
+      : "Pi completed forced automatic compaction without an automatic task retry.";
+    const taskText = request.previousTask
+      ? `\n\nThe most recent user task before compaction was:\n${request.previousTask}`
+      : "";
+    if (ctx.hasUI) {
+      ctx.ui.notify(`Forced automatic compaction completed (${percentText}). Checking unfinished task...`, "info");
+    }
+    try {
+      pi.sendUserMessage(
+        `Pi was forced to compact context because of ${request.reason} (${percentText}). ${retryText} `
+        + "Inspect the compacted context now: if the previously requested task is still unfinished, continue from the interruption point and complete it. If it is already complete, do not repeat completed work; only confirm completion."
+        + taskText,
+      );
+    } catch (error) {
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Failed to continue after forced automatic compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     }
   };
@@ -763,24 +828,67 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
+  // Capture forced native compaction even when the model never had a chance to
+  // call pi_compact. Normal below-window threshold compaction is left alone;
+  // the fallback is for overflow or a measured pre-compaction context >= 100%.
+  pi.on("session_before_compact", (event, ctx) => {
+    if (event.reason === "manual" || pendingCompactRequest) return;
+    if (!managerConfig.compact.resumeAfterForcedAutoCompact) return;
+
+    const contextWindow = ctx.model?.contextWindow ?? 0;
+    const percent = contextWindow > 0 ? (event.preparation.tokensBefore / contextWindow) * 100 : null;
+    const forced = event.reason === "overflow" || (percent !== null && percent >= 100);
+    if (!forced) return;
+
+    if (forcedAutoCompactResume) {
+      forcedAutoCompactResume.reason = event.reason;
+      forcedAutoCompactResume.percent = percent ?? forcedAutoCompactResume.percent;
+      forcedAutoCompactResume.willRetry ||= event.willRetry;
+      const latestTask = getLatestUserTask(event.branchEntries);
+      if (latestTask) forcedAutoCompactResume.previousTask = latestTask;
+      return;
+    }
+
+    forcedAutoCompactResume = {
+      reason: event.reason,
+      percent,
+      willRetry: event.willRetry,
+      previousTask: getLatestUserTask(event.branchEntries),
+      compactionObserved: false,
+    };
+  });
+
   // A model tool call ends its current turn first. Pi may then perform native
   // threshold/overflow compaction. Observe that result and only start manual
   // compaction after the agent is fully settled when no native compaction ran.
   pi.on("session_compact", () => {
     if (pendingCompactRequest) pendingCompactRequest.compactionObserved = true;
+    if (forcedAutoCompactResume) forcedAutoCompactResume.compactionObserved = true;
   });
 
   pi.on("agent_settled", (_event, ctx) => {
     const request = pendingCompactRequest;
-    if (!request || request.manualStarted) return;
-    if (request.compactionObserved) {
-      continueAfterCompaction(request, ctx);
+    if (request && !request.manualStarted) {
+      if (request.compactionObserved) {
+        continueAfterCompaction(request, ctx);
+        return;
+      }
+
+      request.manualStarted = true;
+      if (ctx.hasUI) ctx.ui.notify("No automatic compaction ran. Starting manual compaction...", "warning");
+      runManualCompaction(request, ctx, 1);
       return;
     }
 
-    request.manualStarted = true;
-    if (ctx.hasUI) ctx.ui.notify("No automatic compaction ran. Starting manual compaction...", "warning");
-    runManualCompaction(request, ctx, 1);
+    const forcedResume = forcedAutoCompactResume;
+    if (!forcedResume) return;
+    if (forcedResume.compactionObserved) {
+      continueAfterForcedAutoCompaction(forcedResume, ctx);
+    } else {
+      // The forced auto-compaction attempt failed or was cancelled, so there is
+      // no compacted context from which a continuation can safely start.
+      forcedAutoCompactResume = undefined;
+    }
   });
 
   pi.on("before_agent_start", (event) => {
@@ -1265,7 +1373,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("wm-settings", {
-    description: "Manage pi_reload and pi_compact tool settings",
+    description: "Manage pi_reload, pi_compact, and forced auto-compaction recovery",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
         ctx.ui.notify("/wm-settings requires TUI mode", "error");
@@ -1286,6 +1394,13 @@ export default function (pi: ExtensionAPI) {
             value: "compact",
             label: "Compact tool",
             description: `${managerConfig.compact.enabled ? "enabled" : "disabled"} · threshold >${managerConfig.compact.thresholdPercent}% · ${retrySummary}`,
+          },
+          {
+            value: "forced-auto-compact",
+            label: "Forced auto-compact recovery",
+            description: managerConfig.compact.resumeAfterForcedAutoCompact
+              ? "enabled · overflow or measured context ≥100%"
+              : "disabled",
           },
           { value: "done", label: "Done", description: "Close workspace manager settings" },
         ];
@@ -1360,6 +1475,22 @@ export default function (pi: ExtensionAPI) {
             }],
             (_id, value) => {
               managerConfig.reload.enabled = value === "enabled";
+            },
+          );
+          continue;
+        }
+
+        if (section === "forced-auto-compact") {
+          await showSettings(
+            "Forced Auto-Compact Recovery",
+            [{
+              id: "resumeAfterForcedAutoCompact",
+              label: "Append continuation after overflow / ≥100% auto-compact",
+              currentValue: managerConfig.compact.resumeAfterForcedAutoCompact ? "enabled" : "disabled",
+              values: ["enabled", "disabled"],
+            }],
+            (_id, value) => {
+              managerConfig.compact.resumeAfterForcedAutoCompact = value === "enabled";
             },
           );
           continue;
@@ -1748,6 +1879,7 @@ export default function (pi: ExtensionAPI) {
     if (compactRetryTimer) clearTimeout(compactRetryTimer);
     compactRetryTimer = undefined;
     pendingCompactRequest = undefined;
+    forcedAutoCompactResume = undefined;
     compactInProgress = false;
   });
 

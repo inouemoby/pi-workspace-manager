@@ -18,7 +18,7 @@ On first session start, automatically:
 4. Scans all workspace `.pi/` directories and registers local resources
 5. Removes invalid plugin registrations (files that no longer exist)
 6. Exposes a guarded `pi_compact` tool so the model can compact history and resume an unfinished task when context usage exceeds a configurable threshold (95% by default)
-7. Provides `/wm-settings` to manage the model-callable Reload and Compact tools
+7. Provides `/wm-settings` to manage Reload, Compact, and independent forced auto-compact recovery
 
 This ensures every installed plugin is tracked and manageable through the `/plugins` panel.
 
@@ -27,7 +27,7 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 | Command | Description |
 |---------|-------------|
 | `/plugins` | Plugin management panel — view and toggle plugins across all workspaces |
-| `/wm-settings` | Two-level settings UI for the Reload and Compact tools |
+| `/wm-settings` | Two-level settings UI for Reload, Compact, and forced auto-compact recovery |
 | `/update` | Update pi to the latest version, with real-time progress output |
 
 ### `/wm-settings`
@@ -35,7 +35,8 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 Opens a first-level category menu with separate second-level panels:
 
 - **Reload Tool Settings** — enable or disable the model-callable `pi_reload` tool
-- **Compact Tool Settings** — enable/disable `pi_compact`, set its context threshold, enable transient-failure retries, and set retry count and delay
+- **Compact Tool Settings** — enable/disable `pi_compact`, set its context threshold, and manage transient-failure retries
+- **Forced Auto-Compact Recovery** — independently enable or disable continuation after overflow/≥100% native automatic compaction
 
 Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately. This setting controls the model-callable `pi_reload`; pi's built-in user `/reload` command remains available.
 
@@ -49,7 +50,8 @@ Defaults:
     "thresholdPercent": 95,
     "retryOnFailure": true,
     "maxRetries": 2,
-    "retryDelayMs": 2000
+    "retryDelayMs": 2000,
+    "resumeAfterForcedAutoCompact": true
   }
 }
 ```
@@ -109,6 +111,15 @@ Allows the model to trigger pi's native context compaction when all of these con
 The tool checks its enabled state and context percentage itself and refuses premature calls, calls with unavailable usage, or calls while another compaction is running. Configured transient failures are retried before the tool gives up. After successful compaction it automatically sends a user message instructing pi to continue the unfinished task from the compacted context.
 
 `pi_compact` runs sequentially and terminates its current tool turn. It then waits for pi's native post-turn automatic compaction. If automatic compaction occurs, the tool accepts it and continues the task without starting a duplicate manual compaction. Manual `ctx.compact()` is used only as a fallback after `agent_settled` when no automatic compaction occurred. This avoids the automatic/manual race that otherwise produces `Already compacted`.
+
+### Forced automatic compaction recovery
+
+This recovery path does not depend on the model calling `pi_compact`. When pi is forced into native automatic compaction because of an overflow, or when measured pre-compaction usage is at least 100% of the model context window, the extension captures the latest user task before compaction. After compaction and any built-in compact-and-retry flow have fully settled, it sends a conditional user continuation message:
+
+- Continue from the interruption point if the previous task is unfinished
+- Do not repeat work if the task was already completed
+
+The behavior is controlled by `resumeAfterForcedAutoCompact` and remains available even when the model-callable `pi_compact` tool itself is disabled.
 
 ## Design Notes
 
