@@ -36,7 +36,7 @@ Opens a first-level category menu with separate second-level panels:
 
 - **Reload Tool Settings** — enable or disable the model-callable `pi_reload` tool
 - **Compact Tool Settings** — enable/disable `pi_compact`, set its context threshold, and manage transient-failure retries
-- **Forced Auto-Compact Recovery** — independently enable or disable continuation after overflow/≥100% native automatic compaction
+- **Forced Auto-Compact Recovery** — independently enable/disable continuation after forced native automatic compaction and configure its pre-compaction usage threshold (default 100%)
 
 Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately. This setting controls the model-callable `pi_reload`; pi's built-in user `/reload` command remains available.
 
@@ -51,7 +51,8 @@ Defaults:
     "retryOnFailure": true,
     "maxRetries": 2,
     "retryDelayMs": 2000,
-    "resumeAfterForcedAutoCompact": true
+    "resumeAfterForcedAutoCompact": true,
+    "forcedAutoCompactResumeThresholdPercent": 100
   }
 }
 ```
@@ -114,12 +115,12 @@ The tool checks its enabled state and context percentage itself and refuses prem
 
 ### Forced automatic compaction recovery
 
-This recovery path does not depend on the model calling `pi_compact`. When pi is forced into native automatic compaction because of an overflow, or when measured pre-compaction usage is at least 100% of the model context window, the extension captures the latest user task before compaction. After compaction and any built-in compact-and-retry flow have fully settled, it sends a conditional user continuation message:
+This recovery path does not depend on the model calling `pi_compact`. When measured pre-compaction usage reaches the independently configured recovery threshold (default 100%), the extension captures the latest user task before native automatic compaction. An overflow whose usage percentage cannot be calculated is also treated as a safety fallback. After compaction and any built-in compact-and-retry flow have fully settled, it sends a conditional user continuation message:
 
 - Continue from the interruption point if the previous task is unfinished
 - Do not repeat work if the task was already completed
 
-The behavior is controlled by `resumeAfterForcedAutoCompact` and remains available even when the model-callable `pi_compact` tool itself is disabled.
+The behavior is controlled by `resumeAfterForcedAutoCompact`; its threshold is set by `forcedAutoCompactResumeThresholdPercent` (50–150%). Both are independently configurable under `/wm-settings` → **Forced Auto-Compact Recovery**, and remain effective even when the model-callable `pi_compact` tool itself is disabled.
 
 ## Design Notes
 

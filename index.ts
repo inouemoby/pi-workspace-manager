@@ -43,6 +43,7 @@ interface WorkspaceManagerConfig {
     maxRetries: number;
     retryDelayMs: number;
     resumeAfterForcedAutoCompact: boolean;
+    forcedAutoCompactResumeThresholdPercent: number;
   };
 }
 
@@ -56,6 +57,7 @@ interface PendingCompactRequest {
 interface ForcedAutoCompactResume {
   reason: "threshold" | "overflow";
   percent: number | null;
+  triggerThresholdPercent: number;
   willRetry: boolean;
   previousTask: string;
   compactionObserved: boolean;
@@ -70,6 +72,7 @@ const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
     maxRetries: 2,
     retryDelayMs: 2000,
     resumeAfterForcedAutoCompact: true,
+    forcedAutoCompactResumeThresholdPercent: 100,
   },
 };
 
@@ -112,6 +115,12 @@ function loadManagerConfig(): WorkspaceManagerConfig {
       resumeAfterForcedAutoCompact: typeof rawCompact.resumeAfterForcedAutoCompact === "boolean"
         ? rawCompact.resumeAfterForcedAutoCompact
         : DEFAULT_MANAGER_CONFIG.compact.resumeAfterForcedAutoCompact,
+      forcedAutoCompactResumeThresholdPercent: boundedInteger(
+        rawCompact.forcedAutoCompactResumeThresholdPercent,
+        DEFAULT_MANAGER_CONFIG.compact.forcedAutoCompactResumeThresholdPercent,
+        50,
+        150,
+      ),
     },
   };
 }
@@ -759,6 +768,7 @@ export default function (pi: ExtensionAPI) {
     if (!sessionActive) return;
 
     const percentText = request.percent === null ? "unknown usage" : `${request.percent.toFixed(1)}% context usage`;
+    const thresholdText = `${request.triggerThresholdPercent}% recovery threshold`;
     const retryText = request.willRetry
       ? "Pi has already completed its automatic compact-and-retry flow."
       : "Pi completed forced automatic compaction without an automatic task retry.";
@@ -766,11 +776,11 @@ export default function (pi: ExtensionAPI) {
       ? `\n\nThe most recent user task before compaction was:\n${request.previousTask}`
       : "";
     if (ctx.hasUI) {
-      ctx.ui.notify(`Forced automatic compaction completed (${percentText}). Checking unfinished task...`, "info");
+      ctx.ui.notify(`Forced automatic compaction completed (${percentText}; ${thresholdText}). Checking unfinished task...`, "info");
     }
     try {
       pi.sendUserMessage(
-        `Pi was forced to compact context because of ${request.reason} (${percentText}). ${retryText} `
+        `Pi was forced to compact context because of ${request.reason} (${percentText}; configured ${thresholdText}). ${retryText} `
         + "Inspect the compacted context now: if the previously requested task is still unfinished, continue from the interruption point and complete it. If it is already complete, do not repeat completed work; only confirm completion."
         + taskText,
       );
@@ -829,20 +839,24 @@ export default function (pi: ExtensionAPI) {
   };
 
   // Capture forced native compaction even when the model never had a chance to
-  // call pi_compact. Normal below-window threshold compaction is left alone;
-  // the fallback is for overflow or a measured pre-compaction context >= 100%.
+  // call pi_compact. Known usage must reach the independently configured
+  // recovery threshold. Overflow with unknown usage is retained as a safety
+  // fallback because there is no reliable percentage to compare.
   pi.on("session_before_compact", (event, ctx) => {
     if (event.reason === "manual" || pendingCompactRequest) return;
     if (!managerConfig.compact.resumeAfterForcedAutoCompact) return;
 
     const contextWindow = ctx.model?.contextWindow ?? 0;
     const percent = contextWindow > 0 ? (event.preparation.tokensBefore / contextWindow) * 100 : null;
-    const forced = event.reason === "overflow" || (percent !== null && percent >= 100);
-    if (!forced) return;
+    const recoveryThreshold = managerConfig.compact.forcedAutoCompactResumeThresholdPercent;
+    const thresholdReached = percent !== null && percent >= recoveryThreshold;
+    const unknownOverflow = event.reason === "overflow" && percent === null;
+    if (!thresholdReached && !unknownOverflow) return;
 
     if (forcedAutoCompactResume) {
       forcedAutoCompactResume.reason = event.reason;
       forcedAutoCompactResume.percent = percent ?? forcedAutoCompactResume.percent;
+      forcedAutoCompactResume.triggerThresholdPercent = recoveryThreshold;
       forcedAutoCompactResume.willRetry ||= event.willRetry;
       const latestTask = getLatestUserTask(event.branchEntries);
       if (latestTask) forcedAutoCompactResume.previousTask = latestTask;
@@ -852,6 +866,7 @@ export default function (pi: ExtensionAPI) {
     forcedAutoCompactResume = {
       reason: event.reason,
       percent,
+      triggerThresholdPercent: recoveryThreshold,
       willRetry: event.willRetry,
       previousTask: getLatestUserTask(event.branchEntries),
       compactionObserved: false,
@@ -1399,8 +1414,8 @@ export default function (pi: ExtensionAPI) {
             value: "forced-auto-compact",
             label: "Forced auto-compact recovery",
             description: managerConfig.compact.resumeAfterForcedAutoCompact
-              ? "enabled · overflow or measured context ≥100%"
-              : "disabled",
+              ? `enabled · resume at ≥${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`
+              : `disabled · threshold ${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`,
           },
           { value: "done", label: "Done", description: "Close workspace manager settings" },
         ];
@@ -1481,16 +1496,29 @@ export default function (pi: ExtensionAPI) {
         }
 
         if (section === "forced-auto-compact") {
+          const recoveryThresholdValues = Array.from({ length: 101 }, (_, i) => `${i + 50}%`);
           await showSettings(
             "Forced Auto-Compact Recovery",
-            [{
-              id: "resumeAfterForcedAutoCompact",
-              label: "Append continuation after overflow / ≥100% auto-compact",
-              currentValue: managerConfig.compact.resumeAfterForcedAutoCompact ? "enabled" : "disabled",
-              values: ["enabled", "disabled"],
-            }],
-            (_id, value) => {
-              managerConfig.compact.resumeAfterForcedAutoCompact = value === "enabled";
+            [
+              {
+                id: "resumeAfterForcedAutoCompact",
+                label: "Append continuation after forced auto-compact",
+                currentValue: managerConfig.compact.resumeAfterForcedAutoCompact ? "enabled" : "disabled",
+                values: ["enabled", "disabled"],
+              },
+              {
+                id: "forcedAutoCompactResumeThresholdPercent",
+                label: "Append continuation when pre-compact usage reaches",
+                currentValue: `${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`,
+                values: recoveryThresholdValues,
+              },
+            ],
+            (id, value) => {
+              if (id === "resumeAfterForcedAutoCompact") {
+                managerConfig.compact.resumeAfterForcedAutoCompact = value === "enabled";
+              } else if (id === "forcedAutoCompactResumeThresholdPercent") {
+                managerConfig.compact.forcedAutoCompactResumeThresholdPercent = Number.parseInt(value, 10);
+              }
             },
           );
           continue;
