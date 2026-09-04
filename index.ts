@@ -95,6 +95,15 @@ function boundedInteger(value: unknown, fallback: number, min: number, max: numb
   return Math.min(max, Math.max(min, Math.round(parsed)));
 }
 
+// Flex is not accepted by every Gemini API model. Keep this allowlist aligned
+// with Google's published Flex-supported model families so unsupported models
+// continue using the normal request shape instead of receiving a 400 error.
+function supportsGoogleFlex(model: { id?: string; provider?: string; api?: string } | undefined): boolean {
+  if (model?.provider !== "google" || model.api !== "google-generative-ai") return false;
+  const id = String(model.id || "").toLowerCase().replace(/^models\//, "");
+  return /^(?:gemini-3\.(?:8|7|6)-flash(?:[-.].*)?|gemini-3\.5-(?:flash|flash-lite)(?:[-.].*)?|gemini-3\.1-(?:pro|flash-lite)(?:[-.].*)?|gemini-3-(?:flash|pro-image)(?:[-.].*)?|gemini-2\.5-(?:pro|flash|flash-lite)(?:[-.].*)?)$/.test(id);
+}
+
 function loadManagerConfig(): WorkspaceManagerConfig {
   const settings = readJson(join(PI_AGENT, "settings.json"));
   const raw = settings[MANAGER_CONFIG_KEY] ?? {};
@@ -907,11 +916,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Google Gemini API Flex inference is a request-level setting. Apply it at
-  // the final provider-payload stage so every direct `google` API model uses
-  // Flex without affecting Antigravity's internal gateway or other providers.
+  // the final provider-payload stage for supported direct `google` API models;
+  // unsupported models keep the normal request shape.
   pi.on("before_provider_request", (event, ctx) => {
     const model = ctx.model;
-    if (model?.provider !== "google" || model.api !== "google-generative-ai") return;
+    if (!supportsGoogleFlex(model)) return;
     if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
 
     const payload = event.payload as Record<string, any>;
@@ -927,8 +936,7 @@ export default function (pi: ExtensionAPI) {
   // Give Flex requests enough server-side queue time. This hook is also
   // restricted to the direct Google API, never the Antigravity provider.
   pi.on("before_provider_headers", (event, ctx) => {
-    const model = ctx.model;
-    if (model?.provider === "google" && model.api === "google-generative-ai") {
+    if (supportsGoogleFlex(ctx.model)) {
       event.headers["X-Server-Timeout"] = "900";
     }
   });

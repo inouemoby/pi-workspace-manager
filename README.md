@@ -21,7 +21,7 @@ On first session start, automatically:
 7. Provides `/wm-settings` to manage Reload, Compact, and independent forced auto-compact recovery
 8. Forces direct Google Gemini API requests to use the Flex inference tier
 
-This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference enabled; Antigravity and other providers are not modified.
+This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference when the selected model is on Google's published Flex-supported list; unsupported models, Antigravity, and other providers are not modified.
 
 ## Commands
 
