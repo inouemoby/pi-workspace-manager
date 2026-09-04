@@ -906,6 +906,33 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
+  // Google Gemini API Flex inference is a request-level setting. Apply it at
+  // the final provider-payload stage so every direct `google` API model uses
+  // Flex without affecting Antigravity's internal gateway or other providers.
+  pi.on("before_provider_request", (event, ctx) => {
+    const model = ctx.model;
+    if (model?.provider !== "google" || model.api !== "google-generative-ai") return;
+    if (!event.payload || typeof event.payload !== "object" || Array.isArray(event.payload)) return;
+
+    const payload = event.payload as Record<string, any>;
+    return {
+      ...payload,
+      config: {
+        ...(payload.config && typeof payload.config === "object" ? payload.config : {}),
+        serviceTier: "flex",
+      },
+    };
+  });
+
+  // Give Flex requests enough server-side queue time. This hook is also
+  // restricted to the direct Google API, never the Antigravity provider.
+  pi.on("before_provider_headers", (event, ctx) => {
+    const model = ctx.model;
+    if (model?.provider === "google" && model.api === "google-generative-ai") {
+      event.headers["X-Server-Timeout"] = "900";
+    }
+  });
+
   pi.on("before_agent_start", (event) => {
     if (!managerConfig.compact.enabled) return;
     const retryNote = managerConfig.compact.retryOnFailure

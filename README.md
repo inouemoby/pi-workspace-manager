@@ -19,8 +19,9 @@ On first session start, automatically:
 5. Removes invalid plugin registrations (files that no longer exist)
 6. Exposes a guarded `pi_compact` tool so the model can compact history and resume an unfinished task when context usage exceeds a configurable threshold (95% by default)
 7. Provides `/wm-settings` to manage Reload, Compact, and independent forced auto-compact recovery
+8. Forces direct Google Gemini API requests to use the Flex inference tier
 
-This ensures every installed plugin is tracked and manageable through the `/plugins` panel.
+This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference enabled; Antigravity and other providers are not modified.
 
 ## Commands
 
