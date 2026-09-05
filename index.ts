@@ -1062,6 +1062,9 @@ export default function (pi: ExtensionAPI) {
     const sanitized = stripImageBlocks(event.messages);
     stripImagesForCodexRetry = false;
     if (sanitized.removed === 0) return;
+    // Clearing the poisoned image context starts a fresh retry sequence. Do
+    // not carry the previous failed sequence into the next Codex error.
+    codexRetryAttempts = 0;
     if (ctx.hasUI) {
       ctx.ui.notify(`Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
