@@ -19,7 +19,7 @@ On first session start, automatically:
 5. Removes invalid plugin registrations (files that no longer exist)
 6. Exposes a guarded `pi_compact` tool so the model can compact history and resume an unfinished task when context usage exceeds a configurable threshold (95% by default)
 7. Provides `/wm-settings` to manage Reload, Compact, forced auto-compact recovery, and Codex image-request retry
-8. Promotes image-heavy Codex `Bad Request` failures into Pi's native retry path without changing the request payload
+8. Retries image-heavy Codex `Bad Request` failures without changing the request payload
 9. Forces direct Google Gemini API requests to use the Flex inference tier
 
 This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference when the selected model is on Google's published Flex-supported list; unsupported models, Antigravity, and other providers are not modified.
@@ -38,10 +38,10 @@ Opens a first-level category menu with separate second-level panels:
 
 - **Reload Tool Settings** — enable or disable the model-callable `pi_reload` tool
 - **Compact Tool Settings** — enable/disable `pi_compact`, set its context threshold, and manage transient-failure retries
-- **Codex Image-Request Retry** — promote image-heavy Codex `Bad Request` failures to Pi's native retry mechanism and choose the retry count
+- **Codex Image-Request Retry** — retry image-heavy Codex `Bad Request` failures and choose the retry count
 - **Forced Auto-Compact Recovery** — independently enable/disable continuation after forced native automatic compaction and configure its pre-compaction usage threshold (default 100%)
 
-The Codex recovery is limited to the `openai-codex` provider when the failed session contains image blocks. It does not call `pi.sendUserMessage()`: Pi's native retry, backoff, cancellation, and retry UI are used. The first classified failures keep the original payload; after three consecutive classified failures, the next native retry receives a model-bound context with historical image blocks replaced by text placeholders. The persisted transcript is never rewritten.
+The Codex recovery is limited to the `openai-codex` provider when the failed session contains image blocks. The first classified failures keep the original payload; after three consecutive classified failures, the next retry receives a model-bound context with historical image blocks replaced by text placeholders. The persisted transcript is never rewritten.
 
 Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately. This setting controls the model-callable `pi_reload`; pi's built-in user `/reload` command remains available.
 

@@ -78,10 +78,10 @@ const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
     resumeAfterForcedAutoCompact: true,
     forcedAutoCompactResumeThresholdPercent: 100,
   },
-  // Codex's native retry classifier normally ignores deterministic 400s. This
-  // narrow opt-in promotes image-heavy Codex Bad Requests to that same native
-  // retry path. After three consecutive failures, the next retry gets an
-  // image-free model-bound context as a last-resort recovery.
+  // Codex's retry classifier normally ignores deterministic 400s. This narrow
+  // opt-in promotes image-heavy Codex Bad Requests to the retry path. After
+  // three consecutive failures, the next retry gets an image-free model-bound
+  // context as a last-resort recovery.
   codexRetry: {
     enabled: true,
     maxRetries: 3,
@@ -793,8 +793,8 @@ export default function (pi: ExtensionAPI) {
   let forcedAutoCompactResume: ForcedAutoCompactResume | undefined;
   let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
   // This counter only gates the narrow Codex image-recovery promotion below.
-  // The actual retry, delay, queue handling, and UI remain Pi's native retry
-  // implementation — no synthetic user message is sent.
+  // The actual retry, delay, queue handling, and UI remain Pi's retry
+  // implementation.
   let codexRetryAttempts = 0;
   let stripImagesForCodexRetry = false;
 
@@ -1003,11 +1003,11 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Pi's native retry classifier intentionally does not retry deterministic
-  // HTTP 400 responses. Codex can nevertheless surface an image-heavy request
+  // Pi's retry classifier intentionally does not retry deterministic HTTP 400
+  // responses. Codex can nevertheless surface an image-heavy request
   // rejection as only {"detail":"Bad Request"}. Promote only that narrow,
-  // image-backed Codex case by adding a native retry classification marker to
-  // the assistant error before AgentSession evaluates it. The retry itself is
+  // image-backed Codex case by adding a retry classification marker to the
+  // assistant error before AgentSession evaluates it. The retry itself is
   // still performed by Pi's AgentSession (with its normal retry settings,
   // exponential backoff, cancellation, and UI events).
   pi.on("agent_end", (event, ctx) => {
@@ -1039,23 +1039,23 @@ export default function (pi: ExtensionAPI) {
     if (codexRetryAttempts >= managerConfig.codexRetry.maxRetries) return;
 
     codexRetryAttempts++;
-    // After three consecutive classified failures, let the next native retry
+    // After three consecutive classified failures, let the next retry
     // use an image-free model context. This is a fallback for poisoned/oversized
     // image history, not a transformation of the persisted transcript.
     if (codexRetryAttempts >= 3) stripImagesForCodexRetry = true;
     const original = errorText || "Codex returned an image-heavy request error.";
-    // `server error` is part of Pi's existing native retry pattern. Keep the
+    // `server error` is part of Pi's existing retry pattern. Keep the
     // original provider text so diagnostics are not lost if retries exhaust.
     assistant.errorMessage = `${original}\n[pi-workspace-manager: retryable Codex image-request server error]`;
     if (ctx.hasUI) {
       const imageFallback = stripImagesForCodexRetry && codexRetryAttempts >= 3
         ? "; next retry will omit historical images from the outbound context"
         : "";
-      ctx.ui.notify(`Codex image request rejected; retrying natively (${codexRetryAttempts}/${managerConfig.codexRetry.maxRetries})${imageFallback}.`, "warning");
+      ctx.ui.notify(`Codex image request rejected; retrying (${codexRetryAttempts}/${managerConfig.codexRetry.maxRetries})${imageFallback}.`, "warning");
     }
   });
 
-  // Apply the image fallback only to the next native retry request. The
+  // Apply the image fallback only to the next retry request. The
   // session file and the visible/persisted conversation remain unchanged.
   pi.on("context", (event, ctx) => {
     if (!stripImagesForCodexRetry || ctx.model?.provider !== "openai-codex") return;
@@ -1063,12 +1063,12 @@ export default function (pi: ExtensionAPI) {
     stripImagesForCodexRetry = false;
     if (sanitized.removed === 0) return;
     if (ctx.hasUI) {
-      ctx.ui.notify(`Native Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
+      ctx.ui.notify(`Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
     return { messages: sanitized.messages };
   });
 
-  // A retry budget belongs to one agent run. Reset it after native retries are
+  // A retry budget belongs to one agent run. Reset it after retries are
   // exhausted (or after a successful run), so a later independent user prompt
   // receives a fresh three-retry budget.
   pi.on("agent_settled", () => {
@@ -1586,7 +1586,7 @@ export default function (pi: ExtensionAPI) {
             value: "codex-retry",
             label: "Codex image-request retry",
             description: managerConfig.codexRetry.enabled
-              ? `enabled · ${managerConfig.codexRetry.maxRetries} native retry(s)`
+              ? `enabled · ${managerConfig.codexRetry.maxRetries} retry(s)`
               : "disabled",
           },
           {
@@ -1680,7 +1680,7 @@ export default function (pi: ExtensionAPI) {
             [
               {
                 id: "enabled",
-                label: "Promote image-heavy Bad Request to native retry",
+                label: "Retry image-heavy Bad Request",
                 currentValue: managerConfig.codexRetry.enabled ? "enabled" : "disabled",
                 values: ["enabled", "disabled"],
               },
