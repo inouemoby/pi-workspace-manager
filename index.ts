@@ -52,8 +52,6 @@ interface WorkspaceManagerConfig {
 interface PendingCompactRequest {
   unfinishedTask: string;
   config: WorkspaceManagerConfig["compact"];
-  compactionObserved: boolean;
-  manualStarted: boolean;
 }
 
 interface ReloadRecoveryMarker {
@@ -836,9 +834,9 @@ export default function (pi: ExtensionAPI) {
       customInstructions,
       onComplete: () => continueAfterCompaction(request, ctx),
       onError: (error) => {
-        // Another compaction may have completed between the settled-state check
-        // and this manual attempt. Treat that as success rather than surfacing a
-        // second extension error or retrying an already-compacted session.
+        // Pi's automatic threshold compaction can still win a race with the
+        // immediate manual request. Treat that as success rather than surfacing
+        // a second extension error or retrying an already-compacted session.
         if (/already compacted/i.test(error.message)) {
           continueAfterCompaction(request, ctx);
           return;
@@ -871,29 +869,6 @@ export default function (pi: ExtensionAPI) {
       },
     });
   };
-
-  // A model tool call ends its current turn first. Pi may then perform native
-  // threshold/overflow compaction. Observe that result and only start manual
-  // compaction after the agent is fully settled when no native compaction ran.
-  pi.on("session_compact", () => {
-    if (pendingCompactRequest) pendingCompactRequest.compactionObserved = true;
-  });
-
-  pi.on("agent_settled", (_event, ctx) => {
-    const request = pendingCompactRequest;
-    if (request && !request.manualStarted) {
-      if (request.compactionObserved) {
-        continueAfterCompaction(request, ctx);
-        return;
-      }
-
-      request.manualStarted = true;
-      if (ctx.hasUI) ctx.ui.notify("No automatic compaction ran. Starting manual compaction...", "warning");
-      runManualCompaction(request, ctx, 1);
-      return;
-    }
-
-  });
 
   // Google Gemini API Flex inference is a request-level setting. Apply it at
   // the final provider-payload stage for supported direct `google` API models;
@@ -1911,26 +1886,20 @@ export default function (pi: ExtensionAPI) {
       }
 
       compactInProgress = true;
-      pendingCompactRequest = {
-        unfinishedTask,
-        config: compactConfig,
-        compactionObserved: false,
-        manualStarted: false,
-      };
+      const request: PendingCompactRequest = { unfinishedTask, config: compactConfig };
+      pendingCompactRequest = request;
+      runManualCompaction(request, ctx, 1);
       if (ctx.hasUI) {
-        ctx.ui.notify(
-          `Context at ${usage.percent.toFixed(1)}%. Waiting for pi's automatic compaction before using the manual fallback...`,
-          "warning",
-        );
+        ctx.ui.notify(`Context at ${usage.percent.toFixed(1)}%. Starting manual compaction now...`, "info");
       }
 
       return {
         content: [{
           type: "text",
-          text: `Context usage is ${usage.percent.toFixed(1)}%. Compaction has been queued. Pi's automatic compaction gets priority; a manual fallback runs only if no automatic compaction occurs. The task will resume automatically afterward.`,
+          text: `Context usage is ${usage.percent.toFixed(1)}%. Manual compaction has started immediately; the task will resume only after compaction completes.`,
         }],
         details: {
-          status: "queued",
+          status: "started",
           tokens: usage.tokens,
           contextWindow: usage.contextWindow,
           percent: usage.percent,
@@ -1951,7 +1920,7 @@ export default function (pi: ExtensionAPI) {
     renderResult(result, { isPartial }, theme) {
       if (isPartial) return new Text(theme.fg("warning", "Checking context..."), 0, 0);
       const status = (result.details as { status?: string } | undefined)?.status;
-      if (status === "queued") return new Text(theme.fg("success", "✓ Compaction queued"), 0, 0);
+      if (status === "started") return new Text(theme.fg("success", "✓ Compaction started"), 0, 0);
       if (status === "already-in-progress") return new Text(theme.fg("warning", "Compaction already running"), 0, 0);
       return new Text(theme.fg("warning", "Compaction not needed"), 0, 0);
     },
