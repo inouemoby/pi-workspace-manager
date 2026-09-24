@@ -42,8 +42,6 @@ interface WorkspaceManagerConfig {
     retryOnFailure: boolean;
     maxRetries: number;
     retryDelayMs: number;
-    resumeAfterForcedAutoCompact: boolean;
-    forcedAutoCompactResumeThresholdPercent: number;
   };
   codexRetry: {
     enabled: boolean;
@@ -58,13 +56,10 @@ interface PendingCompactRequest {
   manualStarted: boolean;
 }
 
-interface ForcedAutoCompactResume {
-  reason: "threshold" | "overflow";
-  percent: number | null;
-  triggerThresholdPercent: number;
-  willRetry: boolean;
-  previousTask: string;
-  compactionObserved: boolean;
+interface ReloadRecoveryMarker {
+  session: string;
+  sessionId?: string;
+  createdAt?: number;
 }
 
 const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
@@ -75,13 +70,9 @@ const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
     retryOnFailure: true,
     maxRetries: 2,
     retryDelayMs: 2000,
-    resumeAfterForcedAutoCompact: true,
-    forcedAutoCompactResumeThresholdPercent: 100,
   },
-  // Codex's retry classifier normally ignores deterministic 400s. This narrow
-  // opt-in promotes image-heavy Codex Bad Requests to the retry path. After
-  // three consecutive failures, the next retry gets an image-free model-bound
-  // context as a last-resort recovery.
+  // Promote Codex assistant errors to Pi's native retry path. After three
+  // matching image-request failures, retry once with image-free model context.
   codexRetry: {
     enabled: true,
     maxRetries: 3,
@@ -133,15 +124,6 @@ function loadManagerConfig(): WorkspaceManagerConfig {
         : DEFAULT_MANAGER_CONFIG.compact.retryOnFailure,
       maxRetries: boundedInteger(rawCompact.maxRetries, DEFAULT_MANAGER_CONFIG.compact.maxRetries, 0, 10),
       retryDelayMs: boundedInteger(rawCompact.retryDelayMs, DEFAULT_MANAGER_CONFIG.compact.retryDelayMs, 250, 30000),
-      resumeAfterForcedAutoCompact: typeof rawCompact.resumeAfterForcedAutoCompact === "boolean"
-        ? rawCompact.resumeAfterForcedAutoCompact
-        : DEFAULT_MANAGER_CONFIG.compact.resumeAfterForcedAutoCompact,
-      forcedAutoCompactResumeThresholdPercent: boundedInteger(
-        rawCompact.forcedAutoCompactResumeThresholdPercent,
-        DEFAULT_MANAGER_CONFIG.compact.forcedAutoCompactResumeThresholdPercent,
-        50,
-        150,
-      ),
     },
     codexRetry: {
       enabled: typeof raw.codexRetry?.enabled === "boolean"
@@ -272,6 +254,16 @@ function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed:
     return { ...message, content };
   });
   return { messages: result, removed };
+}
+
+function makeCodexErrorRetryable(errorText: string): string {
+  // Pi's retry classifier checks these explicit account/quota exclusions before
+  // its positive retry patterns. Break only those exact phrases with invisible
+  // separators so the original diagnostic remains readable while the system
+  // retry classifier can handle the error as requested.
+  const nonRetryableLimitError = /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/gi;
+  const retryableText = errorText.replace(nonRetryableLimitError, (match) => [...match].join("\u200B"));
+  return `${retryableText}\n[pi-workspace-manager: retryable Codex server error]`;
 }
 
 function getLatestUserTask(entries: readonly any[]): string {
@@ -790,12 +782,12 @@ export default function (pi: ExtensionAPI) {
   let sessionActive = false;
   let compactInProgress = false;
   let pendingCompactRequest: PendingCompactRequest | undefined;
-  let forcedAutoCompactResume: ForcedAutoCompactResume | undefined;
   let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
-  // This counter only gates the narrow Codex image-recovery promotion below.
-  // The actual retry, delay, queue handling, and UI remain Pi's retry
-  // implementation.
+  // These counters only gate promotion to Pi's native retry path and the
+  // image-specific fallback. Retry scheduling, backoff, and cancellation stay
+  // in Pi's system retry implementation.
   let codexRetryAttempts = 0;
+  let codexImageRetryAttempts = 0;
   let stripImagesForCodexRetry = false;
 
   const applyManagedToolAvailability = () => {
@@ -829,35 +821,6 @@ export default function (pi: ExtensionAPI) {
     } catch (error) {
       if (ctx.hasUI) {
         ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
-      }
-    }
-  };
-
-  const continueAfterForcedAutoCompaction = (request: ForcedAutoCompactResume, ctx: ExtensionContext) => {
-    if (forcedAutoCompactResume !== request) return;
-    forcedAutoCompactResume = undefined;
-    if (!sessionActive) return;
-
-    const percentText = request.percent === null ? "unknown usage" : `${request.percent.toFixed(1)}% context usage`;
-    const thresholdText = `${request.triggerThresholdPercent}% recovery threshold`;
-    const retryText = request.willRetry
-      ? "Pi has already completed its automatic compact-and-retry flow."
-      : "Pi completed forced automatic compaction without an automatic task retry.";
-    const taskText = request.previousTask
-      ? `\n\nThe most recent user task before compaction was:\n${request.previousTask}`
-      : "";
-    if (ctx.hasUI) {
-      ctx.ui.notify(`Forced automatic compaction completed (${percentText}; ${thresholdText}). Checking unfinished task...`, "info");
-    }
-    try {
-      pi.sendUserMessage(
-        `Pi was forced to compact context because of ${request.reason} (${percentText}; configured ${thresholdText}). ${retryText} `
-        + "Inspect the compacted context now: if the previously requested task is still unfinished, continue from the interruption point and complete it. If it is already complete, do not repeat completed work; only confirm completion."
-        + taskText,
-      );
-    } catch (error) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Failed to continue after forced automatic compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
     }
   };
@@ -909,47 +872,11 @@ export default function (pi: ExtensionAPI) {
     });
   };
 
-  // Capture forced native compaction even when the model never had a chance to
-  // call pi_compact. Known usage must reach the independently configured
-  // recovery threshold. Overflow with unknown usage is retained as a safety
-  // fallback because there is no reliable percentage to compare.
-  pi.on("session_before_compact", (event, ctx) => {
-    if (event.reason === "manual" || pendingCompactRequest) return;
-    if (!managerConfig.compact.resumeAfterForcedAutoCompact) return;
-
-    const contextWindow = ctx.model?.contextWindow ?? 0;
-    const percent = contextWindow > 0 ? (event.preparation.tokensBefore / contextWindow) * 100 : null;
-    const recoveryThreshold = managerConfig.compact.forcedAutoCompactResumeThresholdPercent;
-    const thresholdReached = percent !== null && percent >= recoveryThreshold;
-    const unknownOverflow = event.reason === "overflow" && percent === null;
-    if (!thresholdReached && !unknownOverflow) return;
-
-    if (forcedAutoCompactResume) {
-      forcedAutoCompactResume.reason = event.reason;
-      forcedAutoCompactResume.percent = percent ?? forcedAutoCompactResume.percent;
-      forcedAutoCompactResume.triggerThresholdPercent = recoveryThreshold;
-      forcedAutoCompactResume.willRetry ||= event.willRetry;
-      const latestTask = getLatestUserTask(event.branchEntries);
-      if (latestTask) forcedAutoCompactResume.previousTask = latestTask;
-      return;
-    }
-
-    forcedAutoCompactResume = {
-      reason: event.reason,
-      percent,
-      triggerThresholdPercent: recoveryThreshold,
-      willRetry: event.willRetry,
-      previousTask: getLatestUserTask(event.branchEntries),
-      compactionObserved: false,
-    };
-  });
-
   // A model tool call ends its current turn first. Pi may then perform native
   // threshold/overflow compaction. Observe that result and only start manual
   // compaction after the agent is fully settled when no native compaction ran.
   pi.on("session_compact", () => {
     if (pendingCompactRequest) pendingCompactRequest.compactionObserved = true;
-    if (forcedAutoCompactResume) forcedAutoCompactResume.compactionObserved = true;
   });
 
   pi.on("agent_settled", (_event, ctx) => {
@@ -966,15 +893,6 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    const forcedResume = forcedAutoCompactResume;
-    if (!forcedResume) return;
-    if (forcedResume.compactionObserved) {
-      continueAfterForcedAutoCompaction(forcedResume, ctx);
-    } else {
-      // The forced auto-compaction attempt failed or was cancelled, so there is
-      // no compacted context from which a continuation can safely start.
-      forcedAutoCompactResume = undefined;
-    }
   });
 
   // Google Gemini API Flex inference is a request-level setting. Apply it at
@@ -1003,13 +921,10 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Pi's retry classifier intentionally does not retry deterministic HTTP 400
-  // responses. Codex can nevertheless surface an image-heavy request
-  // rejection as only {"detail":"Bad Request"}. Promote only that narrow,
-  // image-backed Codex case by adding a retry classification marker to the
-  // assistant error before AgentSession evaluates it. The retry itself is
-  // still performed by Pi's AgentSession (with its normal retry settings,
-  // exponential backoff, cancellation, and UI events).
+  // Promote every OpenAI Codex assistant error to Pi's native retry classifier.
+  // Pi still owns retry budgets, backoff, cancellation, and retry UI. Keep the
+  // historical-image fallback narrower: only repeated image-request failures
+  // with image-bearing context should strip images from the next outbound try.
   pi.on("agent_end", (event, ctx) => {
     const model = ctx.model;
     if (model?.provider !== "openai-codex" || !managerConfig.codexRetry.enabled) return;
@@ -1026,32 +941,37 @@ export default function (pi: ExtensionAPI) {
 
     if (assistant.stopReason !== "error") {
       codexRetryAttempts = 0;
+      codexImageRetryAttempts = 0;
       stripImagesForCodexRetry = false;
       return;
     }
 
+    if (codexRetryAttempts >= managerConfig.codexRetry.maxRetries) return;
+    codexRetryAttempts++;
+
     const errorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
     const hasImageHistory = countImageBlocks(ctx.sessionManager.getBranch()) > 0;
-    const looksLikeImageRequestFailure =
+    const looksLikeImageRequestFailure = hasImageHistory && (
       /bad request/i.test(errorText) ||
-      /(?:1009|message\s+too\s+big|request\s+(?:body\s+)?(?:too\s+large|size)|inline.?image|image_url)/i.test(errorText);
-    if (!hasImageHistory || !looksLikeImageRequestFailure) return;
-    if (codexRetryAttempts >= managerConfig.codexRetry.maxRetries) return;
+      /(?:1009|message\s+too\s+big|request\s+(?:body\s+)?(?:too\s+large|size)|inline.?image|image_url)/i.test(errorText)
+    );
+    if (looksLikeImageRequestFailure) {
+      codexImageRetryAttempts++;
+      // After three matching image-request failures, let the next retry use
+      // an image-free model context; the persisted transcript stays untouched.
+      if (codexImageRetryAttempts >= 3) stripImagesForCodexRetry = true;
+    }
 
-    codexRetryAttempts++;
-    // After three consecutive classified failures, let the next retry
-    // use an image-free model context. This is a fallback for poisoned/oversized
-    // image history, not a transformation of the persisted transcript.
-    if (codexRetryAttempts >= 3) stripImagesForCodexRetry = true;
-    const original = errorText || "Codex returned an image-heavy request error.";
-    // `server error` is part of Pi's existing retry pattern. Keep the
-    // original provider text so diagnostics are not lost if retries exhaust.
-    assistant.errorMessage = `${original}\n[pi-workspace-manager: retryable Codex image-request server error]`;
+    const original = errorText || "Codex returned an error.";
+    assistant.errorMessage = makeCodexErrorRetryable(original);
     if (ctx.hasUI) {
-      const imageFallback = stripImagesForCodexRetry && codexRetryAttempts >= 3
+      const imageFallback = stripImagesForCodexRetry
         ? "; next retry will omit historical images from the outbound context"
         : "";
-      ctx.ui.notify(`Codex image request rejected; retrying (${codexRetryAttempts}/${managerConfig.codexRetry.maxRetries})${imageFallback}.`, "warning");
+      ctx.ui.notify(
+        `Codex error; scheduling system retry (${codexRetryAttempts}/${managerConfig.codexRetry.maxRetries})${imageFallback}.`,
+        "warning",
+      );
     }
   });
 
@@ -1065,17 +985,18 @@ export default function (pi: ExtensionAPI) {
     // Clearing the poisoned image context starts a fresh retry sequence. Do
     // not carry the previous failed sequence into the next Codex error.
     codexRetryAttempts = 0;
+    codexImageRetryAttempts = 0;
     if (ctx.hasUI) {
       ctx.ui.notify(`Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
     return { messages: sanitized.messages };
   });
 
-  // A retry budget belongs to one agent run. Reset it after retries are
-  // exhausted (or after a successful run), so a later independent user prompt
-  // receives a fresh three-retry budget.
+  // Reset both retry counters after settlement so each independent run starts
+  // with a fresh budget.
   pi.on("agent_settled", () => {
     codexRetryAttempts = 0;
+    codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
   });
 
@@ -1096,6 +1017,7 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
     codexRetryAttempts = 0;
+    codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
     managerConfig = loadManagerConfig();
     applyManagedToolAvailability();
@@ -1563,222 +1485,166 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("wm-settings", {
-    description: "Manage pi_reload, pi_compact, and forced auto-compaction recovery",
+    description: "Manage pi_reload and pi_compact",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
         ctx.ui.notify("/wm-settings requires TUI mode", "error");
         return;
       }
 
-      const chooseSection = async (): Promise<string | null> => {
-        const retrySummary = managerConfig.compact.retryOnFailure
-          ? `${managerConfig.compact.maxRetries} retries / ${managerConfig.compact.retryDelayMs}ms`
-          : "retry off";
-        const items: SelectItem[] = [
-          {
-            value: "reload",
-            label: "Reload tool",
-            description: managerConfig.reload.enabled ? "pi_reload enabled" : "pi_reload disabled",
-          },
-          {
-            value: "compact",
-            label: "Compact tool",
-            description: `${managerConfig.compact.enabled ? "enabled" : "disabled"} · threshold >${managerConfig.compact.thresholdPercent}% · ${retrySummary}`,
-          },
-          {
-            value: "codex-retry",
-            label: "Codex image-request retry",
-            description: managerConfig.codexRetry.enabled
-              ? `enabled · ${managerConfig.codexRetry.maxRetries} retry(s)`
-              : "disabled",
-          },
-          {
-            value: "forced-auto-compact",
-            label: "Forced auto-compact recovery",
-            description: managerConfig.compact.resumeAfterForcedAutoCompact
-              ? `enabled · resume at ≥${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`
-              : `disabled · threshold ${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`,
-          },
-          { value: "done", label: "Done", description: "Close workspace manager settings" },
-        ];
-
-        return ctx.ui.custom<string | null>((tui, theme, _kb, done) => {
-          const container = new Container();
-          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-          container.addChild(new Text(theme.fg("accent", theme.bold(" Workspace Manager Settings")), 1, 0));
-          const list = new SelectList(items, items.length + 1, {
+      await ctx.ui.custom<void>((tui, theme, _kb, done) => {
+        const createValueSubmenu = (
+          title: string,
+          values: string[],
+          currentValue: string,
+          finish: (value?: string) => void,
+        ) => {
+          const options: SelectItem[] = values.map((value) => ({
+            value,
+            label: value === currentValue ? `✓ ${value}` : value,
+          }));
+          const menu = new SelectList(options, Math.min(options.length, 12), {
             selectedPrefix: (s) => theme.fg("accent", s),
             selectedText: (s) => theme.fg("accent", s),
             description: (s) => theme.fg("muted", s),
             scrollInfo: (s) => theme.fg("dim", s),
+            noMatch: (s) => theme.fg("warning", s),
           });
-          list.onSelect = (item) => done(item.value);
-          list.onCancel = () => done(null);
-          container.addChild(list);
-          container.addChild(new Text(theme.fg("dim", " ↑↓ navigate · enter open · esc close"), 1, 0));
-          container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
-          return {
-            render: (width) => container.render(width),
-            invalidate: () => container.invalidate(),
-            handleInput: (data) => { list.handleInput(data); tui.requestRender(); },
-          };
-        });
-      };
+          const currentIndex = values.indexOf(currentValue);
+          menu.setSelectedIndex(currentIndex >= 0 ? currentIndex : 0);
+          menu.onSelect = (item) => finish(item.value);
+          menu.onCancel = () => finish();
 
-      const showSettings = async (
-        title: string,
-        items: SettingItem[],
-        onChange: (id: string, value: string) => void,
-      ): Promise<void> => {
-        await ctx.ui.custom<void>((tui, theme, _kb, done) => {
           const container = new Container();
           container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
           container.addChild(new Text(theme.fg("accent", theme.bold(` ${title}`)), 1, 0));
-          const list = new SettingsList(
-            items,
-            Math.min(items.length + 2, 12),
-            getSettingsListTheme(),
-            (id, value) => {
-              onChange(id, value);
-              persistManagerConfig();
-              ctx.ui.notify(`${title}: ${id} = ${value}`, "info");
-              tui.requestRender();
-            },
-            () => done(undefined),
-          );
-          container.addChild(list);
-          container.addChild(new Text(theme.fg("dim", " ↑↓ select · enter/space change · esc back"), 1, 0));
+          container.addChild(menu);
+          container.addChild(new Text(theme.fg("dim", " ↑↓ select · enter confirm · esc back"), 1, 0));
           container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
           return {
-            render: (width) => container.render(width),
+            render: (width: number) => container.render(width),
             invalidate: () => container.invalidate(),
-            handleInput: (data) => { list.handleInput?.(data); tui.requestRender(); },
+            handleInput: (data: string) => {
+              menu.handleInput(data);
+              tui.requestRender();
+            },
           };
-        });
-      };
-
-      while (true) {
-        const section = await chooseSection();
-        if (!section || section === "done") return;
-
-        if (section === "reload") {
-          await showSettings(
-            "Reload Tool Settings",
-            [{
-              id: "enabled",
-              label: "Model-callable pi_reload",
-              currentValue: managerConfig.reload.enabled ? "enabled" : "disabled",
-              values: ["enabled", "disabled"],
-            }],
-            (_id, value) => {
-              managerConfig.reload.enabled = value === "enabled";
-            },
-          );
-          continue;
-        }
-
-        if (section === "codex-retry") {
-          await showSettings(
-            "Codex Image-Request Retry",
-            [
-              {
-                id: "enabled",
-                label: "Retry image-heavy Bad Request",
-                currentValue: managerConfig.codexRetry.enabled ? "enabled" : "disabled",
-                values: ["enabled", "disabled"],
-              },
-              {
-                id: "maxRetries",
-                label: "Maximum Codex image retries",
-                currentValue: String(managerConfig.codexRetry.maxRetries),
-                values: Array.from({ length: 11 }, (_, i) => String(i)),
-              },
-            ],
-            (id, value) => {
-              if (id === "enabled") managerConfig.codexRetry.enabled = value === "enabled";
-              else if (id === "maxRetries") managerConfig.codexRetry.maxRetries = Number.parseInt(value, 10);
-            },
-          );
-          continue;
-        }
-
-        if (section === "forced-auto-compact") {
-          const recoveryThresholdValues = Array.from({ length: 101 }, (_, i) => `${i + 50}%`);
-          await showSettings(
-            "Forced Auto-Compact Recovery",
-            [
-              {
-                id: "resumeAfterForcedAutoCompact",
-                label: "Append continuation after forced auto-compact",
-                currentValue: managerConfig.compact.resumeAfterForcedAutoCompact ? "enabled" : "disabled",
-                values: ["enabled", "disabled"],
-              },
-              {
-                id: "forcedAutoCompactResumeThresholdPercent",
-                label: "Append continuation when pre-compact usage reaches",
-                currentValue: `${managerConfig.compact.forcedAutoCompactResumeThresholdPercent}%`,
-                values: recoveryThresholdValues,
-              },
-            ],
-            (id, value) => {
-              if (id === "resumeAfterForcedAutoCompact") {
-                managerConfig.compact.resumeAfterForcedAutoCompact = value === "enabled";
-              } else if (id === "forcedAutoCompactResumeThresholdPercent") {
-                managerConfig.compact.forcedAutoCompactResumeThresholdPercent = Number.parseInt(value, 10);
-              }
-            },
-          );
-          continue;
-        }
+        };
 
         const thresholdValues = Array.from({ length: 50 }, (_, i) => `${i + 50}%`);
+        const retryValues = Array.from({ length: 11 }, (_, i) => String(i));
         const retryDelayValues = [...new Set([
           250, 500, 1000, 2000, 3000, 5000, 10000, 30000,
           managerConfig.compact.retryDelayMs,
-        ])].sort((a, b) => a - b).map(String);
-        await showSettings(
-          "Compact Tool Settings",
-          [
-            {
-              id: "enabled",
-              label: "Model-callable pi_compact",
-              currentValue: managerConfig.compact.enabled ? "enabled" : "disabled",
-              values: ["enabled", "disabled"],
-            },
-            {
-              id: "thresholdPercent",
-              label: "Compact when context exceeds",
-              currentValue: `${managerConfig.compact.thresholdPercent}%`,
-              values: thresholdValues,
-            },
-            {
-              id: "retryOnFailure",
-              label: "Retry transient failures",
-              currentValue: managerConfig.compact.retryOnFailure ? "enabled" : "disabled",
-              values: ["enabled", "disabled"],
-            },
-            {
-              id: "maxRetries",
-              label: "Maximum retries after first attempt",
-              currentValue: String(managerConfig.compact.maxRetries),
-              values: Array.from({ length: 11 }, (_, i) => String(i)),
-            },
-            {
-              id: "retryDelayMs",
-              label: "Retry delay (milliseconds)",
-              currentValue: String(managerConfig.compact.retryDelayMs),
-              values: retryDelayValues,
-            },
-          ],
-          (id, value) => {
-            if (id === "enabled") managerConfig.compact.enabled = value === "enabled";
-            else if (id === "thresholdPercent") managerConfig.compact.thresholdPercent = Number.parseInt(value, 10);
-            else if (id === "retryOnFailure") managerConfig.compact.retryOnFailure = value === "enabled";
-            else if (id === "maxRetries") managerConfig.compact.maxRetries = Number.parseInt(value, 10);
-            else if (id === "retryDelayMs") managerConfig.compact.retryDelayMs = Number.parseInt(value, 10);
+        ])].sort((a, b) => a - b).map((ms) => `${ms} ms`);
+        const items: SettingItem[] = [
+          {
+            id: "reload.enabled",
+            label: "Reload · pi_reload tool",
+            description: "Enable or disable the model-callable reload tool",
+            currentValue: managerConfig.reload.enabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
           },
+          {
+            id: "compact.enabled",
+            label: "Compact · pi_compact tool",
+            description: "Enable or disable model-callable context compaction",
+            currentValue: managerConfig.compact.enabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "compact.thresholdPercent",
+            label: "Compact · context threshold",
+            description: "Trigger pi_compact only above this context usage percentage",
+            currentValue: `${managerConfig.compact.thresholdPercent}%`,
+            submenu: (currentValue, finish) => createValueSubmenu("Context threshold", thresholdValues, currentValue, finish),
+          },
+          {
+            id: "compact.retryOnFailure",
+            label: "Compact · retry transient failures",
+            description: "Retry transient manual compaction failures",
+            currentValue: managerConfig.compact.retryOnFailure ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "compact.maxRetries",
+            label: "Compact · maximum retries",
+            description: "Additional attempts after the initial compaction attempt",
+            currentValue: String(managerConfig.compact.maxRetries),
+            submenu: (currentValue, finish) => createValueSubmenu("Maximum compaction retries", retryValues, currentValue, finish),
+          },
+          {
+            id: "compact.retryDelayMs",
+            label: "Compact · retry delay",
+            description: "Delay before retrying a failed manual compaction",
+            currentValue: `${managerConfig.compact.retryDelayMs} ms`,
+            submenu: (currentValue, finish) => createValueSubmenu("Compaction retry delay", retryDelayValues, currentValue, finish),
+          },
+          {
+            id: "codexRetry.enabled",
+            label: "Codex retry · all Codex errors",
+            description: "Promote all OpenAI Codex errors to Pi's system retry",
+            currentValue: managerConfig.codexRetry.enabled ? "enabled" : "disabled",
+            values: ["enabled", "disabled"],
+          },
+          {
+            id: "codexRetry.maxRetries",
+            label: "Codex retry · maximum retries",
+            description: "Maximum Codex assistant errors promoted to the system retry path",
+            currentValue: String(managerConfig.codexRetry.maxRetries),
+            submenu: (currentValue, finish) => createValueSubmenu("Maximum Codex retries", retryValues, currentValue, finish),
+          },
+        ];
+
+        const container = new Container();
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        container.addChild(new Text(theme.fg("accent", theme.bold(" Workspace Manager Settings")), 1, 0));
+        const settingsList = new SettingsList(
+          items,
+          Math.min(items.length, 10),
+          getSettingsListTheme(),
+          (id, value) => {
+            switch (id) {
+              case "reload.enabled":
+                managerConfig.reload.enabled = value === "enabled";
+                break;
+              case "compact.enabled":
+                managerConfig.compact.enabled = value === "enabled";
+                break;
+              case "compact.thresholdPercent":
+                managerConfig.compact.thresholdPercent = Number.parseInt(value, 10);
+                break;
+              case "compact.retryOnFailure":
+                managerConfig.compact.retryOnFailure = value === "enabled";
+                break;
+              case "compact.maxRetries":
+                managerConfig.compact.maxRetries = Number.parseInt(value, 10);
+                break;
+              case "compact.retryDelayMs":
+                managerConfig.compact.retryDelayMs = Number.parseInt(value, 10);
+                break;
+              case "codexRetry.enabled":
+                managerConfig.codexRetry.enabled = value === "enabled";
+                break;
+              case "codexRetry.maxRetries":
+                managerConfig.codexRetry.maxRetries = Number.parseInt(value, 10);
+                break;
+            }
+            persistManagerConfig();
+            ctx.ui.notify(`Saved ${id}: ${value}`, "info");
+            tui.requestRender();
+          },
+          () => done(undefined),
+          { enableSearch: true },
         );
-      }
+        container.addChild(settingsList);
+        container.addChild(new DynamicBorder((s: string) => theme.fg("accent", s)));
+        return {
+          render: (width) => container.render(width),
+          invalidate: () => container.invalidate(),
+          handleInput: (data) => { settingsList.handleInput?.(data); tui.requestRender(); },
+        };
+      });
     },
   });
 
@@ -1906,23 +1772,69 @@ export default function (pi: ExtensionAPI) {
   // 5. Reload recovery
   // ═══════════════════════════════════════════════════════════
 
-  // Flag file: pi_reload tool writes it before triggering restart
+  // The marker is claimed only by a startup/resume that reopened its target session.
   const resumeFlagPath = join(homedir(), ".pi", "agent", ".pi-wm-resume");
+  const sameSessionPath = (left: string, right: string) =>
+    resolve(left).replace(/\\/g, "/").toLowerCase() === resolve(right).replace(/\\/g, "/").toLowerCase();
 
-  // After restart: if flag exists, send resume message to continue conversation
-  pi.on("session_start", async (_event, _ctx) => {
+  pi.on("session_start", (event, ctx) => {
+    if (event.reason !== "startup" && event.reason !== "resume") return;
     if (!fs.existsSync(resumeFlagPath)) return;
-    let data: { message: string };
+
+    let marker: ReloadRecoveryMarker;
     try {
-      data = JSON.parse(fs.readFileSync(resumeFlagPath, "utf-8"));
+      marker = JSON.parse(fs.readFileSync(resumeFlagPath, "utf-8"));
     } catch {
-      data = { message: fs.readFileSync(resumeFlagPath, "utf-8") };
+      return;
     }
-    fs.unlinkSync(resumeFlagPath);
-    const trySend = async () => {
-      try { await pi.sendUserMessage(data.message); } catch { setTimeout(trySend, 1000); }
-    };
-    setTimeout(trySend, 3000);
+
+    const restoredFile = ctx.sessionManager.getSessionFile();
+    const restoredId = ctx.sessionManager.getSessionId();
+    if (
+      typeof marker.session !== "string" ||
+      !restoredFile ||
+      !sameSessionPath(marker.session, restoredFile) ||
+      (marker.sessionId !== undefined && marker.sessionId !== restoredId)
+    ) {
+      return;
+    }
+
+    // Atomically claim the one-shot marker so a second pi process cannot also
+    // trigger recovery for the same reload.
+    const claimedPath = `${resumeFlagPath}.${process.pid}.claimed`;
+    try {
+      fs.renameSync(resumeFlagPath, claimedPath);
+    } catch {
+      return;
+    }
+
+    try {
+      const claimed = JSON.parse(fs.readFileSync(claimedPath, "utf-8")) as ReloadRecoveryMarker;
+      if (
+        claimed.session !== marker.session ||
+        claimed.sessionId !== marker.sessionId ||
+        !sameSessionPath(claimed.session, restoredFile)
+      ) {
+        try { fs.renameSync(claimedPath, resumeFlagPath); } catch { fs.rmSync(claimedPath, { force: true }); }
+        return;
+      }
+      fs.unlinkSync(claimedPath);
+    } catch {
+      try { fs.rmSync(claimedPath, { force: true }); } catch {}
+      return;
+    }
+
+    setTimeout(() => {
+      const activeFile = ctx.sessionManager.getSessionFile();
+      if (!activeFile || !sameSessionPath(marker.session, activeFile)) return;
+      if (ctx.sessionManager.getSessionId() !== restoredId) return;
+      pi.sendMessage({
+        customType: "pi-workspace-manager-reload-recovery",
+        content: "Pi restarted via pi_reload and restored this original session. Continue the interrupted task from the existing conversation; do not repeat completed work. If the task is already complete, simply confirm that.",
+        display: false,
+        details: { session: marker.session, createdAt: marker.createdAt },
+      }, { triggerTurn: true });
+    }, 3000);
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -2077,7 +1989,7 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_reload",
     label: "Pi Reload",
-    description: "Restart pi to reload extensions, skills, themes, and config. Conversation is automatically resumed after restart.",
+    description: "Restart pi to reload extensions, skills, themes, and config. Resume the interrupted task only after the original session is restored.",
     promptSnippet: "Reload pi to apply changes",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
@@ -2088,12 +2000,20 @@ export default function (pi: ExtensionAPI) {
         };
       }
 
-      const sessionFile = ctx.sessionManager.sessionFile;
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      if (!sessionFile) {
+        return {
+          content: [{ type: "text", text: "Reload refused: the current conversation has no persisted session to restore." }],
+          details: { status: "no-session-file" },
+          isError: true,
+        };
+      }
+
       const cwd = ctx.cwd;
       fs.writeFileSync(resumeFlagPath, JSON.stringify({
-        message: "pi_reload completed. Continuing from where we left off.",
-        cwd,
         session: sessionFile,
+        sessionId: ctx.sessionManager.getSessionId(),
+        createdAt: Date.now(),
       }), "utf-8");
       launchTerminalDetached(cwd, sessionFile);
       process.exit(0);
@@ -2112,11 +2032,11 @@ export default function (pi: ExtensionAPI) {
   pi.on("session_shutdown", () => {
     sessionActive = false;
     codexRetryAttempts = 0;
+    codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
     if (compactRetryTimer) clearTimeout(compactRetryTimer);
     compactRetryTimer = undefined;
     pendingCompactRequest = undefined;
-    forcedAutoCompactResume = undefined;
     compactInProgress = false;
   });
 
