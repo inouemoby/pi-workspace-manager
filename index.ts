@@ -1838,7 +1838,7 @@ export default function (pi: ExtensionAPI) {
   });
 
   // ═══════════════════════════════════════════════════════════
-  // 6. Tools — pi_compact, pi_update, and pi_reload
+  // 6. Tools — pi_compact and pi_reload
   // ═══════════════════════════════════════════════════════════
 
   // Model-triggered compaction is deliberately guarded. The model may decide
@@ -1958,35 +1958,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.registerTool({
-    name: "pi_update",
-    label: "Pi Update",
-    description: "Update pi and all installed packages to the latest version (--all). Downloads and installs updates. Run pi_reload after to apply.",
-    promptSnippet: "Update pi and all packages to latest",
-    parameters: Type.Object({}),
-    async execute(_id, _params, _signal, _onUpdate, _ctx) {
-      const child = spawn("pi", ["update", "--all"], { stdio: ["ignore", "pipe", "pipe"], shell: true });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (d: Buffer) => { stdout += d.toString(); });
-      child.stderr.on("data", (d: Buffer) => { stderr += d.toString(); });
-      await new Promise<void>((resolve) => { child.on("close", () => resolve()); });
-      if (child.exitCode !== 0) {
-        return { content: [{ type: "text", text: "Update failed: " + (stderr.trim() || stdout.trim()) }], isError: true };
-      }
-      const lastLine = stdout.trim().split("\n").pop() || "Done";
-      return { content: [{ type: "text", text: "Update complete: " + lastLine + "\nUse pi_reload to apply." }] };
-    },
-    renderCall(_args, theme) {
-      return new Text(theme.fg("toolTitle", theme.bold("pi_update ")) + theme.fg("dim", "updating..."), 0, 0);
-    },
-    renderResult(result, { isPartial }, theme) {
-      if (isPartial) return new Text(theme.fg("warning", "Updating..."), 0, 0);
-      if (result.isError) return new Text(theme.fg("error", "Failed"), 0, 0);
-      return new Text(theme.fg("success", "\u2713 Updated"), 0, 0);
-    },
-  });
-
-  pi.registerTool({
     name: "pi_reload",
     label: "Pi Reload",
     description: "Restart pi to reload extensions, skills, themes, and config. Resume the interrupted task only after the original session is restored.",
@@ -2040,7 +2011,7 @@ export default function (pi: ExtensionAPI) {
     compactInProgress = false;
   });
 
-  // Keep /update command as well (non-tool fallback)
+  // User-invoked /update command
   pi.registerCommand("update", {
     description: "Update pi and all installed packages (--all)",
     handler: async (_args, ctx) => {
