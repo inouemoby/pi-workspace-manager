@@ -17,7 +17,7 @@ On first session start, automatically:
 3. Creates `.ignore` files to prevent double-loading via auto-discover
 4. Scans all workspace `.pi/` directories and registers local resources
 5. Removes invalid plugin registrations (files that no longer exist)
-6. Exposes a guarded `pi_compact` tool so the model can compact history and resume an unfinished task when context usage exceeds a configurable threshold (95% by default)
+6. Exposes `pi_compact` to compact conversation context
 7. Provides `/wm-settings` to manage Reload, Compact, and Codex system retries
 8. Promotes any OpenAI Codex assistant error to Pi's native retry path; repeated image-request failures retain the image-stripping fallback
 9. Forces direct Google Gemini API requests to use the Flex inference tier
@@ -36,13 +36,13 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 
 Opens a single searchable settings list, following pi's native settings interaction. Type to filter settings; toggles change directly, while numeric settings open a selectable submenu instead of cycling values with repeated Enter presses.
 
-- **Reload** — enable or disable `pi_reload`; recovery runs only after the matching original session is restored and uses a hidden extension message instead of a normal user message
-- **Compact** — enable/disable `pi_compact`, set its context threshold, and manage transient-failure retries
+- **Reload** — enable or disable the Pi restart tool
+- **Compact** — enable or disable the context compaction tool, and configure its threshold and retries
 - **Codex system retry** — promote any `openai-codex` assistant error to Pi's native retry path and set the extension retry cap
 
 Pi handles retry scheduling, backoff, cancellation, and its global retry limit. After three matching image-request failures during one agent run with image-bearing history, the next retry omits historical images from the outbound context; the persisted transcript is never rewritten.
 
-Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately. This setting controls the model-callable `pi_reload`; pi's built-in user `/reload` command remains available.
+Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately.
 
 Defaults:
 
@@ -109,15 +109,11 @@ LLM-callable tool for searching sessions across all workspaces. Useful when the 
 
 ### `pi_compact`
 
-Allows the model to trigger pi's native context compaction when all of these conditions hold:
+Compacts conversation context.
 
-- The current task is unfinished
-- Context usage is strictly above the configured threshold (95% by default)
-- The model supplies a concise description of the remaining work and immediate next step
+### `pi_reload`
 
-The tool checks its enabled state and context percentage itself and refuses premature calls, calls with unavailable usage, or calls while another compaction is running. Configured transient failures are retried before the tool gives up. After successful compaction it automatically sends a user message instructing pi to continue the unfinished task from the compacted context.
-
-`pi_compact` runs sequentially, starts `ctx.compact()` immediately, and terminates its current tool turn. It does not wait for Pi's automatic threshold compaction. Pi aborts the interrupted agent operation as manual compaction begins; the tool queues the task continuation only from the compaction completion callback, after the compressed session is ready.
+Restarts Pi and resumes the current session.
 
 ## Design Notes
 

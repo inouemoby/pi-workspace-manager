@@ -813,9 +813,9 @@ export default function (pi: ExtensionAPI) {
 
   const continueAfterCompaction = (request: PendingCompactRequest, ctx: ExtensionContext) => {
     if (!clearPendingCompaction(request) || !sessionActive) return;
-    if (ctx.hasUI) ctx.ui.notify("Context compaction completed. Continuing task...", "info");
+    if (ctx.hasUI) ctx.ui.notify("Context compaction complete.", "info");
     try {
-      pi.sendUserMessage(`上下文压缩已完成。请根据压缩后的上下文继续执行尚未完成的任务：${request.unfinishedTask}`);
+      pi.sendUserMessage(`继续任务：${request.unfinishedTask}`);
     } catch (error) {
       if (ctx.hasUI) {
         ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
@@ -824,11 +824,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   const runManualCompaction = (request: PendingCompactRequest, ctx: ExtensionContext, attempt: number) => {
-    const customInstructions = [
-      "The current task is unfinished. Preserve everything required to resume it accurately after compaction.",
-      `Unfinished task and next step: ${request.unfinishedTask}`,
-      "Retain the user's original requirements and constraints, completed and pending work, key decisions, exact file paths and edits, errors, verification results, and concrete next steps.",
-    ].join("\n");
+    const customInstructions = `Summarize the context needed to continue this task: ${request.unfinishedTask}`;
 
     ctx.compact({
       customInstructions,
@@ -973,16 +969,6 @@ export default function (pi: ExtensionAPI) {
     codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
-  });
-
-  pi.on("before_agent_start", (event) => {
-    if (!managerConfig.compact.enabled) return;
-    const retryNote = managerConfig.compact.retryOnFailure
-      ? `Transient failures may be retried up to ${managerConfig.compact.maxRetries} time(s).`
-      : "Failure retry is disabled.";
-    return {
-      systemPrompt: `${event.systemPrompt}\n\nRuntime pi_compact setting: the task must be unfinished and context usage must be strictly above ${managerConfig.compact.thresholdPercent}% before calling the tool. ${retryNote}`,
-    };
   });
 
   // ═══════════════════════════════════════════════════════════
@@ -1516,21 +1502,21 @@ export default function (pi: ExtensionAPI) {
           {
             id: "reload.enabled",
             label: "Reload · pi_reload tool",
-            description: "Enable or disable the model-callable reload tool",
+            description: "Enable or disable Pi restart.",
             currentValue: managerConfig.reload.enabled ? "enabled" : "disabled",
             values: ["enabled", "disabled"],
           },
           {
             id: "compact.enabled",
             label: "Compact · pi_compact tool",
-            description: "Enable or disable model-callable context compaction",
+            description: "Enable or disable context compaction.",
             currentValue: managerConfig.compact.enabled ? "enabled" : "disabled",
             values: ["enabled", "disabled"],
           },
           {
             id: "compact.thresholdPercent",
             label: "Compact · context threshold",
-            description: "Trigger pi_compact only above this context usage percentage",
+            description: "Context usage threshold for compaction.",
             currentValue: `${managerConfig.compact.thresholdPercent}%`,
             submenu: (currentValue, finish) => createValueSubmenu("Context threshold", thresholdValues, currentValue, finish),
           },
@@ -1805,7 +1791,7 @@ export default function (pi: ExtensionAPI) {
       if (ctx.sessionManager.getSessionId() !== restoredId) return;
       pi.sendMessage({
         customType: "pi-workspace-manager-reload-recovery",
-        content: "Pi restarted via pi_reload and restored this original session. Continue the interrupted task from the existing conversation; do not repeat completed work. If the task is already complete, simply confirm that.",
+        content: "Continue the current session.",
         display: false,
         details: { session: marker.session, createdAt: marker.createdAt },
       }, { triggerTurn: true });
@@ -1816,37 +1802,27 @@ export default function (pi: ExtensionAPI) {
   // 6. Tools — pi_compact and pi_reload
   // ═══════════════════════════════════════════════════════════
 
-  // Model-triggered compaction is deliberately guarded. The model may decide
-  // whether its task is unfinished, but the extension independently enforces
-  // the configured context threshold before allowing compaction.
+  // Context compaction tool.
   pi.registerTool({
     name: "pi_compact",
     label: "Pi Compact",
-    description: "Compact older conversation history so an unfinished task can continue. Use only when the current task is not finished AND context usage is strictly above the configured threshold (default 95%). The tool checks its enabled state and threshold, optionally retries transient failures, and automatically resumes the task after success.",
-    promptSnippet: "Compact history only when an unfinished task must continue and context usage exceeds the configured threshold",
-    promptGuidelines: [
-      "Use pi_compact only when the current task is still unfinished and context usage is strictly above its configured threshold (default 95%); never use pi_compact for routine cleanup or after the task is complete.",
-      "When pi_compact is necessary, describe the remaining work precisely in unfinishedTask so compaction preserves it and the automatic continuation message resumes the correct work.",
-    ],
+    description: "Compact conversation context.",
     parameters: Type.Object({
-      unfinishedTask: Type.String({
-        minLength: 1,
-        description: "Concise description of the unfinished task, current progress, and immediate next step to resume after compaction.",
-      }),
+      unfinishedTask: Type.String({ minLength: 1 }),
     }),
     executionMode: "sequential",
     async execute(_id, params, _signal, _onUpdate, ctx) {
       const compactConfig = { ...managerConfig.compact };
       if (!compactConfig.enabled) {
         return {
-          content: [{ type: "text", text: "Compaction refused: pi_compact is disabled in /wm-settings." }],
+          content: [{ type: "text", text: "Context compaction is disabled." }],
           details: { status: "disabled" },
         };
       }
 
       if (compactInProgress) {
         return {
-          content: [{ type: "text", text: "Compaction is already in progress. Do not request another one." }],
+          content: [{ type: "text", text: "Compaction is already in progress." }],
           details: { status: "already-in-progress" },
           terminate: true,
         };
@@ -1855,7 +1831,7 @@ export default function (pi: ExtensionAPI) {
       const usage = ctx.getContextUsage();
       if (!usage || usage.percent === null || usage.tokens === null) {
         return {
-          content: [{ type: "text", text: `Compaction refused: current context usage is unavailable. Continue without compacting unless a later call reports usage above the configured ${compactConfig.thresholdPercent}% threshold.` }],
+          content: [{ type: "text", text: "Context usage is unavailable." }],
           details: { status: "refused", reason: "usage-unavailable", thresholdPercent: compactConfig.thresholdPercent },
         };
       }
@@ -1864,7 +1840,7 @@ export default function (pi: ExtensionAPI) {
         return {
           content: [{
             type: "text",
-            text: `Compaction refused: context usage is ${usage.percent.toFixed(1)}%, which has not exceeded the configured ${compactConfig.thresholdPercent}% threshold. Continue the task without compacting.`,
+            text: `Context usage is below the configured threshold (${compactConfig.thresholdPercent}%).`,
           }],
           details: {
             status: "refused",
@@ -1880,7 +1856,7 @@ export default function (pi: ExtensionAPI) {
       const unfinishedTask = params.unfinishedTask.trim();
       if (!unfinishedTask) {
         return {
-          content: [{ type: "text", text: "Compaction refused: unfinishedTask must describe the work that remains." }],
+          content: [{ type: "text", text: "unfinishedTask is required." }],
           details: { status: "refused", reason: "missing-unfinished-task" },
         };
       }
@@ -1896,7 +1872,7 @@ export default function (pi: ExtensionAPI) {
       return {
         content: [{
           type: "text",
-          text: `Context usage is ${usage.percent.toFixed(1)}%. Manual compaction has started immediately; the task will resume only after compaction completes.`,
+          text: "Compaction started.",
         }],
         details: {
           status: "started",
@@ -1929,13 +1905,12 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "pi_reload",
     label: "Pi Reload",
-    description: "Restart pi to reload extensions, skills, themes, and config. Resume the interrupted task only after the original session is restored.",
-    promptSnippet: "Reload pi to apply changes",
+    description: "Restart Pi and resume the current session.",
     parameters: Type.Object({}),
     async execute(_id, _params, _signal, _onUpdate, ctx) {
       if (!managerConfig.reload.enabled) {
         return {
-          content: [{ type: "text", text: "Reload refused: pi_reload is disabled in /wm-settings." }],
+          content: [{ type: "text", text: "Pi restart is disabled." }],
           details: { status: "disabled" },
         };
       }
@@ -1943,7 +1918,7 @@ export default function (pi: ExtensionAPI) {
       const sessionFile = ctx.sessionManager.getSessionFile();
       if (!sessionFile) {
         return {
-          content: [{ type: "text", text: "Reload refused: the current conversation has no persisted session to restore." }],
+          content: [{ type: "text", text: "Pi restart is unavailable." }],
           details: { status: "no-session-file" },
           isError: true,
         };
