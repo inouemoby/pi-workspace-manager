@@ -7,7 +7,7 @@
  * 4. Guarded model-triggered context compaction with automatic task continuation
  */
 
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   Container, type SelectItem, SelectList,
@@ -22,6 +22,39 @@ import {
 import { homedir } from "node:os";
 import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
+// The marker is bookkeeping only: it is hidden and never sent to the model.
+export const RECOVERY_MARKER = "pi-workspace-manager:empty-enter-recovery";
+
+export function shouldResumeOnEnter({ enter, text, idle, autocomplete }: {
+  enter: boolean; text: string; idle: boolean; autocomplete: boolean;
+}): boolean {
+  return enter && !text.trim() && idle && !autocomplete;
+}
+
+export function hasUnfinishedTurn(entries: readonly any[]): boolean {
+  if (!entries.some((entry) => entry.type === "message" && entry.message?.role === "user")) return false;
+  const last = [...entries].reverse().find((entry) =>
+    entry.type === "message" && ["user", "assistant", "toolResult"].includes(entry.message?.role));
+  if (!last) return false;
+  if (last.message.role === "assistant") return last.message.stopReason !== "stop";
+  return last.message.role === "user" || last.message.role === "toolResult";
+}
+
+export function isRecoveryMarker(message: any): boolean {
+  return message?.role === "custom" && message.customType === RECOVERY_MARKER;
+}
+
+export function withoutRecoveryMarkers(messages: readonly any[]): readonly any[] {
+  if (!messages.some(isRecoveryMarker)) return messages;
+  const filtered = messages.filter((message) => !isRecoveryMarker(message));
+  // Only on a recovery request: the failed assistant tail remains visible in
+  // the saved session, but must not become extra context for the next request.
+  while (filtered.length > 1 && filtered.at(-1)?.role === "assistant" &&
+         filtered.at(-1)?.stopReason !== "stop") {
+    filtered.pop();
+  }
+  return filtered;
+}
 
 const HOME = homedir();
 const PI_AGENT = join(HOME, ".pi", "agent");
@@ -969,6 +1002,47 @@ export default function (pi: ExtensionAPI) {
     codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
+  });
+
+  // The empty custom marker starts an ordinary session turn without giving
+  // the model any new instructions. Remove all such markers on every request.
+  pi.on("context", (event) => {
+    const messages = withoutRecoveryMarkers(event.messages);
+    if (messages !== event.messages) return { messages };
+  });
+
+  // Intercept only an empty Enter while idle and a turn is unfinished.
+  // Typed input, autocomplete and Pi's native working display stay unchanged.
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    const previousFactory = ctx.ui.getEditorComponent();
+    ctx.ui.setEditorComponent((tui, theme, keybindings) => {
+      // Pi's default editor embeds the working indicator in its top border.
+      // Preserve that option when wrapping the editor; otherwise Pi moves it
+      // to a separate status line and changes the native working display.
+      const editor = previousFactory?.(tui, theme, keybindings) ??
+        new CustomEditor(tui, theme, keybindings, { embedWorkingStatus: true });
+      const handleInput = editor.handleInput.bind(editor);
+      editor.handleInput = (data: string) => {
+        const autocomplete = editor as typeof editor & { isShowingAutocomplete?: () => boolean };
+        if (shouldResumeOnEnter({
+          enter: matchesKey(data, "enter"),
+          text: editor.getText(),
+          idle: ctx.isIdle(),
+          autocomplete: autocomplete.isShowingAutocomplete?.() ?? false,
+        }) && !ctx.hasPendingMessages() && hasUnfinishedTurn(ctx.sessionManager.getBranch())) {
+          editor.setText("");
+          try {
+            pi.sendMessage({ customType: RECOVERY_MARKER, content: [], display: false }, { triggerTurn: true });
+          } catch (error) {
+            ctx.ui.notify(`Could not resume interrupted task: ${error instanceof Error ? error.message : String(error)}`, "error");
+          }
+          return;
+        }
+        handleInput(data);
+      };
+      return editor;
+    });
   });
 
   // ═══════════════════════════════════════════════════════════

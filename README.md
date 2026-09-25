@@ -21,6 +21,7 @@ On first session start, automatically:
 7. Provides `/wm-settings` to manage Reload, Compact, and Codex system retries
 8. Promotes any OpenAI Codex assistant error to Pi's native retry path; repeated image-request failures retain the image-stripping fallback
 9. Forces direct Google Gemini API requests to use the Flex inference tier
+10. Resumes unfinished turns on empty Enter while idle, without a new user prompt
 
 This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference when the selected model is on Google's published Flex-supported list; unsupported models, Antigravity, and other providers are not modified.
 
@@ -31,6 +32,12 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 | `/plugins` | Plugin management panel — view and toggle plugins across all workspaces |
 | `/wm-settings` | Searchable settings list for Reload, Compact, and Codex system retries |
 | `/update` | Update pi to the latest version, with real-time progress output |
+
+### Empty Enter recovery
+
+Pressing Enter in an empty editor while Pi is idle resumes an interrupted turn (error, cancellation, or incomplete reply) through the ordinary session lifecycle. It works as an installed extension with stock Pi: no core patch or restart is required; `/reload` loads the change. Normal completions do not restart. Typed input, Enter while running, and autocomplete retain their usual behavior. The working indicator remains in Pi's usual editor border.
+
+The extension triggers the turn with an **invisible, empty custom marker** and removes that marker and the failed assistant tail before model serialization. No new prompt or recovery instruction reaches the model. One hidden marker entry remains in the session journal for bookkeeping; it is not displayed and is filtered from every future model request. This is the trade-off for a plugin-only implementation.
 
 ### `/wm-settings`
 
