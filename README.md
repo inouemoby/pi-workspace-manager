@@ -72,6 +72,8 @@ Defaults:
 
 `compact.maxRetries` counts additional attempts after the initial compaction. `codexRetry.maxRetries` gates how many Codex assistant errors this extension promotes; Pi's global `retry.maxRetries` remains an additional upper bound. Cancellation and exhausted retry budgets still stop retries.
 
+After manual compaction, the extension resumes the unfinished task only if the same session is idle and nobody submitted a new message. Text entered during compaction belongs to Pi's own queue and takes priority over automatic continuation. The resumed task is sent as one hidden custom message through Pi's normal session turn, avoiding competing prompts.
+
 ### `/update`
 
 Runs `pi update` asynchronously. Progress is shown in real-time so the UI does not freeze. After completion, run `/reload` to apply the new version.

@@ -24,6 +24,7 @@ import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
 // The marker is bookkeeping only: it is hidden and never sent to the model.
 export const RECOVERY_MARKER = "pi-workspace-manager:empty-enter-recovery";
+const COMPACTION_RESUME_TYPE = "pi-workspace-manager:compaction-resume";
 
 export function shouldResumeOnEnter({ enter, text, idle, autocomplete }: {
   enter: boolean; text: string; idle: boolean; autocomplete: boolean;
@@ -85,6 +86,9 @@ interface WorkspaceManagerConfig {
 interface PendingCompactRequest {
   unfinishedTask: string;
   config: WorkspaceManagerConfig["compact"];
+  sessionId: string;
+  generation: number;
+  userSubmitted: boolean;
 }
 
 interface ReloadRecoveryMarker {
@@ -814,6 +818,9 @@ export default function (pi: ExtensionAPI) {
   let compactInProgress = false;
   let pendingCompactRequest: PendingCompactRequest | undefined;
   let compactRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  let compactResumeTimer: ReturnType<typeof setTimeout> | undefined;
+  let sessionGeneration = 0;
+  let userInputEpoch = 0;
   // These counters only gate promotion to Pi's native retry path and the
   // image-specific fallback. Retry scheduling, backoff, and cancellation stay
   // in Pi's system retry implementation.
@@ -838,22 +845,56 @@ export default function (pi: ExtensionAPI) {
   const clearPendingCompaction = (request: PendingCompactRequest): boolean => {
     if (pendingCompactRequest !== request) return false;
     if (compactRetryTimer) clearTimeout(compactRetryTimer);
+    if (compactResumeTimer) clearTimeout(compactResumeTimer);
     compactRetryTimer = undefined;
+    compactResumeTimer = undefined;
     pendingCompactRequest = undefined;
     compactInProgress = false;
     return true;
   };
 
+  const noteUserInput = () => {
+    userInputEpoch++;
+    if (!pendingCompactRequest) return;
+    pendingCompactRequest.userSubmitted = true;
+    // Once compaction has finished, no background retry or implicit resume
+    // should remain scheduled after the user has taken over the conversation.
+    if (compactRetryTimer || compactResumeTimer) clearPendingCompaction(pendingCompactRequest);
+  };
+
+  const isCurrentCompaction = (request: PendingCompactRequest, ctx: ExtensionContext): boolean => {
+    if (pendingCompactRequest !== request || !sessionActive || request.generation !== sessionGeneration) return false;
+    try { return ctx.sessionManager.getSessionId() === request.sessionId; }
+    catch { return false; } // A session switch or reload invalidates the old ctx.
+  };
+
   const continueAfterCompaction = (request: PendingCompactRequest, ctx: ExtensionContext) => {
-    if (!clearPendingCompaction(request) || !sessionActive) return;
+    if (!isCurrentCompaction(request, ctx) || compactResumeTimer) return;
     if (ctx.hasUI) ctx.ui.notify("Context compaction complete.", "info");
-    try {
-      pi.sendUserMessage(`继续任务：${request.unfinishedTask}`);
-    } catch (error) {
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
+    // Pi emits compaction_end first. Its TUI then flushes messages typed during
+    // compaction, but that queue is not exposed by ctx.hasPendingMessages().
+    // Yield to the TUI and let an actual user submission take precedence.
+    compactResumeTimer = setTimeout(() => {
+      compactResumeTimer = undefined;
+      if (!isCurrentCompaction(request, ctx)) return;
+      let shouldResume = !request.userSubmitted;
+      try { shouldResume &&= ctx.isIdle() && !ctx.hasPendingMessages(); }
+      catch { shouldResume = false; }
+      clearPendingCompaction(request);
+      if (!shouldResume) return;
+      // Unlike sendUserMessage(), sendMessage() starts the session run before
+      // its first await. A new editor submission can then only queue, never
+      // race a still-idle preflight into two simultaneous agent.prompt() calls.
+      try {
+        pi.sendMessage({
+          customType: COMPACTION_RESUME_TYPE,
+          content: `继续任务：${request.unfinishedTask}`,
+          display: false,
+        }, { triggerTurn: true, deliverAs: "followUp" });
+      } catch (error) {
+        if (ctx.hasUI) ctx.ui.notify(`Failed to continue after compaction: ${error instanceof Error ? error.message : String(error)}`, "error");
       }
-    }
+    }, 0);
   };
 
   const runManualCompaction = (request: PendingCompactRequest, ctx: ExtensionContext, attempt: number) => {
@@ -863,9 +904,9 @@ export default function (pi: ExtensionAPI) {
       customInstructions,
       onComplete: () => continueAfterCompaction(request, ctx),
       onError: (error) => {
-        // Pi's automatic threshold compaction can still win a race with the
-        // immediate manual request. Treat that as success rather than surfacing
-        // a second extension error or retrying an already-compacted session.
+        if (!isCurrentCompaction(request, ctx)) return;
+        // Auto-compaction can win the race. Resume only after the same idle and
+        // user-input checks as an ordinary completed manual compaction.
         if (/already compacted/i.test(error.message)) {
           continueAfterCompaction(request, ctx);
           return;
@@ -873,7 +914,7 @@ export default function (pi: ExtensionAPI) {
 
         const retriesUsed = attempt - 1;
         const retryable = !/(cancelled|canceled|nothing to compact)/i.test(error.message);
-        const shouldRetry = sessionActive
+        const shouldRetry = !request.userSubmitted
           && request.config.retryOnFailure
           && retriesUsed < request.config.maxRetries
           && retryable;
@@ -887,14 +928,17 @@ export default function (pi: ExtensionAPI) {
           }
           compactRetryTimer = setTimeout(() => {
             compactRetryTimer = undefined;
-            if (!sessionActive || pendingCompactRequest !== request) return;
+            if (!isCurrentCompaction(request, ctx) || request.userSubmitted) {
+              clearPendingCompaction(request);
+              return;
+            }
             runManualCompaction(request, ctx, attempt + 1);
           }, request.config.retryDelayMs);
           return;
         }
 
         if (!clearPendingCompaction(request)) return;
-        if (ctx.hasUI) ctx.ui.notify(`Context compaction failed: ${error.message}`, "error");
+        if (ctx.hasUI && !request.userSubmitted) ctx.ui.notify(`Context compaction failed: ${error.message}`, "error");
       },
     });
   };
@@ -1004,6 +1048,13 @@ export default function (pi: ExtensionAPI) {
     stripImagesForCodexRetry = false;
   });
 
+  // User input from RPC or from Pi's post-compaction queue also supersedes
+  // the implicit continuation. TUI submissions are captured even earlier in
+  // the editor, before Pi's asynchronous prompt preflight starts.
+  pi.on("input", (event) => {
+    if (event.source !== "extension") noteUserInput();
+  });
+
   // The empty custom marker starts an ordinary session turn without giving
   // the model any new instructions. Remove all such markers on every request.
   pi.on("context", (event) => {
@@ -1014,6 +1065,9 @@ export default function (pi: ExtensionAPI) {
   // Intercept only an empty Enter while idle and a turn is unfinished.
   // Typed input, autocomplete and Pi's native working display stay unchanged.
   pi.on("session_start", (_event, ctx) => {
+    if (pendingCompactRequest) clearPendingCompaction(pendingCompactRequest);
+    sessionActive = true;
+    sessionGeneration++;
     if (ctx.mode !== "tui") return;
     const previousFactory = ctx.ui.getEditorComponent();
     ctx.ui.setEditorComponent((tui, theme, keybindings) => {
@@ -1025,12 +1079,16 @@ export default function (pi: ExtensionAPI) {
       const handleInput = editor.handleInput.bind(editor);
       editor.handleInput = (data: string) => {
         const autocomplete = editor as typeof editor & { isShowingAutocomplete?: () => boolean };
+        if ((keybindings.matches(data, "tui.input.submit") ||
+             keybindings.matches(data, "app.message.followUp")) && editor.getText().trim() &&
+            !autocomplete.isShowingAutocomplete?.()) noteUserInput();
         if (shouldResumeOnEnter({
           enter: matchesKey(data, "enter"),
           text: editor.getText(),
           idle: ctx.isIdle(),
           autocomplete: autocomplete.isShowingAutocomplete?.() ?? false,
-        }) && !ctx.hasPendingMessages() && hasUnfinishedTurn(ctx.sessionManager.getBranch())) {
+        }) && !pendingCompactRequest && !ctx.hasPendingMessages() && hasUnfinishedTurn(ctx.sessionManager.getBranch())) {
+          userInputEpoch++;
           editor.setText("");
           try {
             pi.sendMessage({ customType: RECOVERY_MARKER, content: [], display: false }, { triggerTurn: true });
@@ -1825,6 +1883,9 @@ export default function (pi: ExtensionAPI) {
 
     const restoredFile = ctx.sessionManager.getSessionFile();
     const restoredId = ctx.sessionManager.getSessionId();
+    const restoredLeaf = ctx.sessionManager.getLeafId();
+    const inputEpochAtStart = userInputEpoch;
+    const generationAtStart = sessionGeneration;
     if (
       typeof marker.session !== "string" ||
       !restoredFile ||
@@ -1860,15 +1921,19 @@ export default function (pi: ExtensionAPI) {
     }
 
     setTimeout(() => {
-      const activeFile = ctx.sessionManager.getSessionFile();
-      if (!activeFile || !sameSessionPath(marker.session, activeFile)) return;
-      if (ctx.sessionManager.getSessionId() !== restoredId) return;
-      pi.sendMessage({
-        customType: "pi-workspace-manager-reload-recovery",
-        content: "Continue the current session.",
-        display: false,
-        details: { session: marker.session, createdAt: marker.createdAt },
-      }, { triggerTurn: true });
+      if (generationAtStart !== sessionGeneration || inputEpochAtStart !== userInputEpoch || !sessionActive) return;
+      try {
+        const activeFile = ctx.sessionManager.getSessionFile();
+        if (!activeFile || !sameSessionPath(marker.session, activeFile)) return;
+        if (ctx.sessionManager.getSessionId() !== restoredId || ctx.sessionManager.getLeafId() !== restoredLeaf) return;
+        if (!ctx.isIdle() || ctx.hasPendingMessages() || pendingCompactRequest) return;
+        pi.sendMessage({
+          customType: "pi-workspace-manager-reload-recovery",
+          content: "Continue the current session.",
+          display: false,
+          details: { session: marker.session, createdAt: marker.createdAt },
+        }, { triggerTurn: true, deliverAs: "followUp" });
+      } catch { /* A replaced session has invalidated ctx; never resume it. */ }
     }, 3000);
   });
 
@@ -1936,7 +2001,13 @@ export default function (pi: ExtensionAPI) {
       }
 
       compactInProgress = true;
-      const request: PendingCompactRequest = { unfinishedTask, config: compactConfig };
+      const request: PendingCompactRequest = {
+        unfinishedTask,
+        config: compactConfig,
+        sessionId: ctx.sessionManager.getSessionId(),
+        generation: sessionGeneration,
+        userSubmitted: false,
+      };
       pendingCompactRequest = request;
       runManualCompaction(request, ctx, 1);
       if (ctx.hasUI) {
@@ -2023,10 +2094,7 @@ export default function (pi: ExtensionAPI) {
     codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;
     stripImagesForCodexRetry = false;
-    if (compactRetryTimer) clearTimeout(compactRetryTimer);
-    compactRetryTimer = undefined;
-    pendingCompactRequest = undefined;
-    compactInProgress = false;
+    if (pendingCompactRequest) clearPendingCompaction(pendingCompactRequest);
   });
 
   // User-invoked /update command
