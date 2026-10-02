@@ -22,6 +22,7 @@ import {
 import { homedir } from "node:os";
 import { spawn, execSync } from "node:child_process";
 import * as fs from "node:fs";
+import { canonicalGitIdentity, canonicalPluginIdentity } from "./plugin-identity.ts";
 // The marker is bookkeeping only: it is hidden and never sent to the model.
 export const RECOVERY_MARKER = "pi-workspace-manager:empty-enter-recovery";
 const COMPACTION_RESUME_TYPE = "pi-workspace-manager:compaction-resume";
@@ -497,11 +498,49 @@ function listInstalledThemes(): string[] {
 type ResourceState = "global" | "workspace" | "removed";
 
 interface ManagedResource {
-  id: string;       // e.g. "extensions/ollama-usage" or "git:github.com/..."
+  id: string;       // Representative settings reference for this resource
+  identity: string; // Stable identity shared by package refs and local checkout aliases
+  aliases: string[]; // Alternate refs/source variants for the same plugin
   name: string;     // display name
   installed: boolean;
   state: ResourceState;
   type: "skill" | "package";  // skill → skills[] array, package → packages[] array
+}
+
+function localRepositoryIdentity(ref: string, cwd: string): string | undefined {
+  if (/^(?:git|github|npm):/i.test(ref)) return undefined;
+  const candidates = /^[A-Za-z]:\//.test(ref) || ref.startsWith("/")
+    ? [ref]
+    : [resolve(PI_AGENT, ref), resolve(cwd, ref)];
+  for (const candidate of candidates) {
+    const directory = existsSync(candidate) && statSync(candidate).isDirectory() ? candidate : dirname(candidate);
+    const packageJson = readJson(join(directory, "package.json"));
+    const repository = typeof packageJson.repository === "string"
+      ? packageJson.repository
+      : packageJson.repository?.url;
+    const fromPackage = typeof repository === "string" ? canonicalGitIdentity(repository) : undefined;
+    if (fromPackage) return fromPackage;
+
+    try {
+      const gitConfig = readFileSync(join(directory, ".git", "config"), "utf8");
+      const origin = gitConfig.match(/\[remote "origin"\][\s\S]*?\burl\s*=\s*([^\r\n]+)/i)?.[1]?.trim();
+      const fromGit = origin ? canonicalGitIdentity(origin) : undefined;
+      if (fromGit) return fromGit;
+    } catch { /* Not a local git checkout. */ }
+  }
+  return undefined;
+}
+
+function packageIdentity(ref: string, name: string, cwd: string): string {
+  return canonicalPluginIdentity(ref, name, localRepositoryIdentity(ref, cwd));
+}
+
+const PACKAGE_OVERRIDE_FIELDS = ["extensions", "themes", "prompts"] as const;
+
+function resolvePackageRef(ref: string, base: string): string {
+  const normalized = ref.replace(/\\/g, "/");
+  if (/^(?:git|github|npm):/i.test(normalized) || normalized.includes(":") || normalized.startsWith("/")) return normalized;
+  return resolve(base, normalized).replace(/\\/g, "/");
 }
 
 function buildResourceIndex(cwd: string): ManagedResource[] {
@@ -563,7 +602,7 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
   };
 
   // ── Packages channel: packages[] array + extensions/themes/prompts overrides (existing behavior) ──
-  const overrideFields = ["extensions", "themes", "prompts"];
+  const overrideFields = PACKAGE_OVERRIDE_FIELDS;
   const resolveRel = (rawId: string, base: string) => {
     if (rawId.startsWith("git:") || rawId.startsWith("npm:") || rawId.startsWith("github:")) return rawId;
     if (rawId.includes(":") || rawId.startsWith("/")) return rawId;
@@ -581,6 +620,41 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
   const collectAllRefs = (settings: any, base: string): string[] => {
     return [...collectActiveRefs(settings, base), ...(settings._disabledPackages || [])];
   };
+
+  // Keep at most one settings reference per plugin in the global/current pair.
+  // Global wins; workspaces other than cwd are intentionally not normalized here.
+  const registrationFields = ["packages", ...overrideFields, "_disabledPackages"];
+  const normalizeScopeRegistrations = (settings: any, base: string, reserved = new Set<string>()) => {
+    const identities = new Set(reserved);
+    let changed = false;
+    for (const field of registrationFields) {
+      const entries = settings[field];
+      if (!Array.isArray(entries)) continue;
+      const isOverride = (overrideFields as readonly string[]).includes(field);
+      const filtered = entries.filter((entry: string) => {
+        const resolved = isOverride ? resolveRel(entry, base) : resolvePackageRef(entry, base);
+        const name = resolved.split("/").pop() || resolved;
+        const identity = packageIdentity(resolved, name, cwd);
+        if (identities.has(identity)) {
+          changed = true;
+          return false;
+        }
+        identities.add(identity);
+        return true;
+      });
+      if (filtered.length !== entries.length) settings[field] = filtered;
+    }
+    return { identities, changed };
+  };
+  const globalNormalization = normalizeScopeRegistrations(globalSettings, PI_AGENT);
+  const workspaceNormalization = normalizeScopeRegistrations(projSettings, cwd, globalNormalization.identities);
+  if (globalNormalization.changed) writeJson(join(PI_AGENT, "settings.json"), globalSettings);
+  if (workspaceNormalization.changed) {
+    const projPath = join(cwd, ".pi", "settings.json");
+    const isSystemDir = /^(?:[A-Z]:\\(?:Windows|Program Files|Program Files \(x86\)))\b/i.test(cwd);
+    if (!isSystemDir) writeJson(projPath, projSettings);
+  }
+
   const globalActiveRefs = collectActiveRefs(globalSettings, PI_AGENT);
   const projActiveRefs = collectActiveRefs(projSettings, cwd);
   const globalAllRefs = collectAllRefs(globalSettings, PI_AGENT);
@@ -592,22 +666,26 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
     for (const ref of collectAllRefs(wsSettings, wsCwd)) allWorkspaceRefs.add(ref);
   }
 
-  const getPkgState = (id: string): ResourceState => {
-    const nid = normalize(id);
-    if (globalActiveRefs.some(p => normalize(p) === nid)) return "global";
-    if (projActiveRefs.some(p => normalize(p) === nid)) return "workspace";
+  const getPkgState = (aliases: string[]): ResourceState => {
+    const refs = new Set(aliases.map(normalize));
+    if (globalActiveRefs.some(p => refs.has(normalize(p)))) return "global";
+    if (projActiveRefs.some(p => refs.has(normalize(p)))) return "workspace";
     return "removed";
   };
 
-  const resources: ManagedResource[] = [];
-  const seen = new Set<string>();
-
-  const add = (id: string, name: string, type: "skill" | "package") => {
+  const resourcesByIdentity = new Map<string, ManagedResource>();
+  const add = (id: string, name: string, type: "skill" | "package", installed = true) => {
     const nid = normalize(id);
-    if (seen.has(nid)) return;
-    seen.add(nid);
-    const state = type === "skill" ? getSkillState(id) : getPkgState(id);
-    resources.push({ id: nid, name, installed: true, state, type });
+    const identity = type === "skill" ? `skill:${nid}` : packageIdentity(nid, name, cwd);
+    let resource = resourcesByIdentity.get(identity);
+    if (!resource) {
+      resource = { id: nid, identity, aliases: [], name: name.replace(/@[^@/]+$/, ""), installed, state: "removed", type };
+      resourcesByIdentity.set(identity, resource);
+    }
+    if (!resource.aliases.includes(nid)) resource.aliases.push(nid);
+    resource.installed ||= installed;
+    if (type === "skill") resource.state = getSkillState(nid);
+    else resource.state = getPkgState(resource.aliases);
   };
 
   // Physical scan — global skills (recursive, finds nested SKILL.md)
@@ -640,7 +718,6 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
         if (f.startsWith(".") || f === ".ignore") continue;
         const full = join(wsResDir, f);
         const absPath = full.replace(/\\/g, "/");
-        if (seen.has(absPath)) continue;
         let valid = false;
         if (resType === "extensions") {
           valid = f.endsWith(".ts") || f.endsWith(".mjs") || f.endsWith(".js") ||
@@ -648,10 +725,7 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
         } else {
           valid = f.endsWith(".js") || f.endsWith(".ts") || f.endsWith(".md") || statSync(full).isDirectory();
         }
-        if (valid) {
-          seen.add(absPath);
-          resources.push({ id: absPath, name: f, installed: true, state: getPkgState(absPath), type: "package" });
-        }
+        if (valid) add(absPath, f, "package");
       }
     } catch { /* */ }
   }
@@ -660,22 +734,16 @@ function buildResourceIndex(cwd: string): ManagedResource[] {
   const allRegisteredIds = new Set([...globalAllRefs, ...projAllRefs, ...allWorkspaceRefs]);
   for (const rawId of allRegisteredIds) {
     const id = normalize(rawId);
-    if (!seen.has(id)) {
-      seen.add(id);
-      resources.push({ id, name: id.split("/").pop() || id, installed: existsSync(id) || rawId.startsWith("git:") || rawId.startsWith("npm:"), state: getPkgState(id), type: "package" });
-    }
+    add(id, id.split("/").pop() || id, "package",
+      existsSync(id) || rawId.startsWith("git:") || rawId.startsWith("npm:"));
   }
   // Add skill refs from settings not physically found
   for (const rawId of [...globalActiveSkills, ...projActiveSkills, ...allWsSkillRefs]) {
     const id = normalize(rawId);
-    if (!seen.has(id)) {
-      seen.add(id);
-      resources.push({ id, name: id.split("/").pop() || id, installed: existsSync(resolve(PI_AGENT, id)), state: getSkillState(id), type: "skill" });
-    }
+    add(id, id.split("/").pop() || id, "skill", existsSync(resolve(PI_AGENT, id)));
   }
 
-  resources.sort((a, b) => a.name.localeCompare(b.name));
-  return resources;
+  return [...resourcesByIdentity.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<string, ResourceState>) {
@@ -698,51 +766,50 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
   let projSkills: string[] = [...(projSettings.skills || [])];
   let projDisabled: string[] = [...(projSettings._disabledPackages || [])];
 
-  // Collect all other workspace settings that might be affected
-  const otherWorkspaceSettings: Array<{ cwd: string; path: string; pkgs: string[]; skills: string[]; disabled: string[] }> = [];
-  for (const dir of listSessionDirs()) {
-    const wsCwd = sessionDirToCwd(dir);
-    if (normalize(wsCwd) === normalize(cwd)) continue; // skip current workspace
-    const wsPath = join(wsCwd, ".pi", "settings.json");
-    const wsSettings = readJson(wsPath);
-    if (!wsSettings.packages && !wsSettings.skills && !wsSettings._disabledPackages) continue;
-    otherWorkspaceSettings.push({
-      cwd: wsCwd, path: wsPath,
-      pkgs: [...(wsSettings.packages || [])],
-      skills: [...(wsSettings.skills || [])],
-      disabled: [...(wsSettings._disabledPackages || [])],
-    });
-  }
-
   for (const [id, newState] of changes) {
-    const resource = resources.find(r => normalize(r.id) === normalize(id));
+    const resource = resources.find(r => normalize(r.id) === normalize(id) || r.aliases.some(alias => matchRef(alias, id)));
+    const refs = resource?.aliases ?? [id];
     const originalState = resource?.state ?? "removed";
     const isSkill = resource?.type === "skill";
+    const matchesResource = (ref: string, base: string) => {
+      if (refs.some(alias => matchRef(ref, alias))) return true;
+      if (!resource || isSkill) return false;
+      const resolved = resolvePackageRef(ref, base);
+      const name = resolved.split("/").pop() || resolved;
+      return packageIdentity(resolved, name, cwd) === resource.identity;
+    };
+    const matchesGlobal = (ref: string) => matchesResource(ref, PI_AGENT);
+    const matchesProj = (ref: string) => matchesResource(ref, cwd);
 
-    // Helper: remove id from one scope's appropriate array(s)
+    // Apply each state transition to every known source alias in the global/current-workspace pair.
     const removeFromGlobal = () => {
-      if (isSkill) globalSkills = globalSkills.filter(p => !matchRef(p, id));
-      else globalPkgs = globalPkgs.filter(p => !matchRef(p, id));
-      globalDisabled = globalDisabled.filter(p => !matchRef(p, id));
+      if (isSkill) globalSkills = globalSkills.filter(p => !matchesGlobal(p));
+      else globalPkgs = globalPkgs.filter(p => !matchesGlobal(p));
+      globalDisabled = globalDisabled.filter(p => !matchesGlobal(p));
+      for (const field of PACKAGE_OVERRIDE_FIELDS) {
+        if (Array.isArray(globalSettings[field])) {
+          globalSettings[field] = globalSettings[field].filter((p: string) => !matchesGlobal(p));
+        }
+      }
     };
     const removeFromProj = () => {
-      if (isSkill) projSkills = projSkills.filter(p => !matchRef(p, id));
-      else projPkgs = projPkgs.filter(p => !matchRef(p, id));
-      projDisabled = projDisabled.filter(p => !matchRef(p, id));
-    };
-    const removeFromAllOtherWs = () => {
-      for (const ws of otherWorkspaceSettings) {
-        if (isSkill) ws.skills = ws.skills.filter(p => !matchRef(p, id));
-        else ws.pkgs = ws.pkgs.filter(p => !matchRef(p, id));
-        ws.disabled = ws.disabled.filter(p => !matchRef(p, id));
+      if (isSkill) projSkills = projSkills.filter(p => !matchesProj(p));
+      else projPkgs = projPkgs.filter(p => !matchesProj(p));
+      projDisabled = projDisabled.filter(p => !matchesProj(p));
+      for (const field of PACKAGE_OVERRIDE_FIELDS) {
+        if (Array.isArray(projSettings[field])) {
+          projSettings[field] = projSettings[field].filter((p: string) => !matchesProj(p));
+        }
       }
+    };
+    const addDisabledRecord = (target: string[]) => {
+      if (!target.some(existing => matchRef(existing, id))) target.push(id);
     };
 
     if (newState === "global") {
-      // Remove from ALL lists everywhere, then add to global
+      // Global and the current workspace are mutually exclusive; other workspaces are independent.
       removeFromGlobal();
       removeFromProj();
-      removeFromAllOtherWs();
       if (isSkill) globalSkills.push(id);
       else globalPkgs.push(id);
 
@@ -754,18 +821,22 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
       else projPkgs.push(id);
 
     } else {
-      // "removed" — only remove from the scope it belongs to
-      if (originalState === "global") {
-        removeFromGlobal();
-        globalDisabled.push(id);
-      } else if (originalState === "workspace") {
-        removeFromProj();
-        projDisabled.push(id);
-      } else {
-        // Not in any scope — just add to disabled
-        globalDisabled.push(id);
+      // Remove any registration in the global/current-workspace pair, then keep one disabled record.
+      const globalRegistrations = [...globalPkgs, ...globalSkills, ...globalDisabled,
+        ...PACKAGE_OVERRIDE_FIELDS.flatMap(field => globalSettings[field] || [])];
+      const workspaceRegistrations = [...projPkgs, ...projSkills, ...projDisabled,
+        ...PACKAGE_OVERRIDE_FIELDS.flatMap(field => projSettings[field] || [])];
+      const hasGlobalRegistration = globalRegistrations.some(matchesGlobal);
+      const hasWorkspaceRegistration = workspaceRegistrations.some(matchesProj);
+      if (!hasGlobalRegistration && !hasWorkspaceRegistration) continue;
+      removeFromGlobal();
+      removeFromProj();
+      if (!isSkill) {
+        const disabledTarget = originalState === "workspace" || (!hasGlobalRegistration && hasWorkspaceRegistration)
+          ? projDisabled
+          : globalDisabled;
+        addDisabledRecord(disabledTarget);
       }
-      // Never touch other workspaces
     }
   }
 
@@ -784,18 +855,6 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
     writeJson(projPath, projSettings);
   }
 
-  // Write other affected workspace settings
-  for (const ws of otherWorkspaceSettings) {
-    const origSettings = readJson(ws.path);
-    const changed = JSON.stringify(origSettings.packages || []) !== JSON.stringify(ws.pkgs) ||
-                    JSON.stringify(origSettings.skills || []) !== JSON.stringify(ws.skills);
-    if (changed) {
-      origSettings.packages = ws.pkgs;
-      origSettings.skills = ws.skills;
-      if (ws.disabled.length > 0) origSettings._disabledPackages = ws.disabled;
-      writeJson(ws.path, origSettings);
-    }
-  }
 }
 
 // ─── Plugin Manager TUI ─────────────────────────────────────
@@ -1571,7 +1630,9 @@ export default function (pi: ExtensionAPI) {
         for (const [id, newState] of changes) {
           const r = resources.find(r2 => r2.id === id);
           const origState = r?.state ?? "removed";
-          if (newState !== origState) realChanges.set(id, newState);
+          if (newState !== origState || (r?.type === "package" && r.aliases.length > 1)) {
+            realChanges.set(id, newState);
+          }
         }
         if (realChanges.size > 0) {
           applyChanges(cwd, resources, realChanges);

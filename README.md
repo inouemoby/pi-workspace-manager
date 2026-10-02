@@ -81,7 +81,7 @@ Runs `pi update` asynchronously. Progress is shown in real-time so the UI does n
 
 ## `/plugins` — Plugin Manager
 
-Unified TUI panel showing all plugins (extensions, skills, themes) from all workspaces.
+Unified TUI panel showing all plugins (extensions, skills, themes) from all workspaces. Package references that resolve to the same plugin repository are grouped into one row, including Git branch aliases and local checkouts with matching repository metadata. A plugin may be registered globally or in the current workspace, never both; when opening the manager, a global registration takes precedence and duplicate current-workspace registrations are removed. Other workspaces are independent and are never changed by this cleanup.
 
 Each plugin has three mutually exclusive states:
 
@@ -108,9 +108,9 @@ Each plugin has three mutually exclusive states:
 
 | Action | Current workspace | Other workspaces |
 |--------|------------------|-----------------|
-| Global | Add to global packages | Remove from all workspace packages |
-| Workspace | Add to current workspace, remove from global | No change |
-| Remove | Remove from its current scope (global or workspace) | No change |
+| Global | Add globally and remove current-workspace duplicates | No change |
+| Workspace | Add to current workspace and remove global registration | No change |
+| Remove | Remove global/current registrations and keep at most one disabled record | No change |
 
 ## Tools
 
