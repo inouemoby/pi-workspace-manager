@@ -10,7 +10,7 @@
 import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
-  Container, type SelectItem, SelectList,
+  Container, Input, type SelectItem, SelectList,
   type SettingItem, SettingsList, Text, matchesKey,
 } from "@earendil-works/pi-tui";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
@@ -800,7 +800,6 @@ function applyChanges(cwd: string, resources: ManagedResource[], changes: Map<st
 
 // ─── Plugin Manager TUI ─────────────────────────────────────
 
-const TABS = ["Extensions", "Skills", "Others"] as const;
 const STATE_LABELS: Record<ResourceState, string> = {
   global: "🌐 Global",
   workspace: "📁 Workspace",
@@ -1461,27 +1460,28 @@ export default function (pi: ExtensionAPI) {
         return changes.get(r.id) ?? r.state;
       };
 
-      let selected = 0;
-      const maxVisible = 14;
-
       const saved = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
         const container = new Container();
         const border1 = new DynamicBorder((s: string) => theme.fg("accent", s));
         const headerText = new Text("", 1, 0);
+        const searchInput = new Input();
+        const searchSpacer = new Text("", 1, 0);
         const listText = new Text("", 0, 0);
         const helpText = new Text("", 1, 0);
         const border2 = new DynamicBorder((s: string) => theme.fg("accent", s));
         container.addChild(border1);
         container.addChild(headerText);
+        container.addChild(searchInput);
+        container.addChild(searchSpacer);
         container.addChild(listText);
         container.addChild(helpText);
         container.addChild(border2);
         let currentWidth = 80;
+        let selected = 0;
+        let filtered: ManagedResource[] = [];
+        const maxVisible = 14;
 
         const refresh = () => {
-          resources = buildResourceIndex(cwd);
-          if (selected >= resources.length) selected = Math.max(0, resources.length - 1);
-
           const ws = workspaceName(cwd);
           const dirtyCount = [...changes.entries()].filter(([id, st]) => {
             const r = resources.find(r2 => r2.id === id);
@@ -1489,18 +1489,24 @@ export default function (pi: ExtensionAPI) {
           }).length;
           headerText.setText(theme.fg("accent", theme.bold(` Plugins — ${ws}`)) + (dirtyCount > 0 ? theme.fg("warning", `  (${dirtyCount} changed)` ) : ""));
 
+          const query = searchInput.getValue().trim().toLowerCase();
+          filtered = resources.filter((r) =>
+            !query || `${r.name} ${r.id} ${r.type}`.toLowerCase().includes(query),
+          );
+          selected = Math.max(0, Math.min(selected, filtered.length - 1));
+
           const lines: string[] = [];
-          if (resources.length === 0) {
-            lines.push(theme.fg("dim", "  (no resources found)"));
+          if (filtered.length === 0) {
+            lines.push(theme.fg("dim", resources.length === 0 ? "  (no resources found)" : "  (no matching resources)"));
           } else {
             let scrollStart = Math.max(0, selected - Math.floor(maxVisible / 2));
-            const scrollEnd = Math.min(resources.length, scrollStart + maxVisible);
+            const scrollEnd = Math.min(filtered.length, scrollStart + maxVisible);
             scrollStart = Math.max(0, scrollEnd - maxVisible);
 
             for (let i = scrollStart; i < scrollEnd; i++) {
-              const r = resources[i];
-              const st = getEffectiveState(r);
-              const changed = changes.has(r.id) && st !== (r.state ?? "removed");
+              const r = filtered[i];
+              const state = getEffectiveState(r);
+              const changed = changes.has(r.id) && state !== (r.state ?? "removed");
               const cursor = i === selected ? theme.fg("accent", "→") : " ";
               const mark = changed ? theme.fg("warning", "●") : " ";
               const typeTag = r.type === "skill" ? theme.fg("accent", "S") : theme.fg("dim", "P");
@@ -1508,17 +1514,16 @@ export default function (pi: ExtensionAPI) {
               const prefix = r.installed ? "       " : theme.fg("warning", "[MISS] ");
               const nameRaw = r.name;
               const nameStr = nameRaw.length > nameMax ? nameRaw.slice(0, nameMax - 1) + "…" : nameRaw.padEnd(nameMax);
-              const stateStr = theme.fg(STATE_COLORS[st], STATE_LABELS[st]);
+              const stateStr = theme.fg(STATE_COLORS[state], STATE_LABELS[state]);
               lines.push(` ${cursor} ${mark} ${prefix}${typeTag} ${nameStr}${stateStr}`);
             }
 
-            if (resources.length > maxVisible) {
-              lines.push(theme.fg("dim", `  ${scrollStart + 1}-${scrollEnd} of ${resources.length}`));
+            if (filtered.length > maxVisible) {
+              lines.push(theme.fg("dim", `  ${scrollStart + 1}-${scrollEnd} of ${filtered.length}`));
             }
           }
           listText.setText(lines.join("\n"));
-
-          helpText.setText(theme.fg("dim", " S=skill P=pkg | ↑↓ move  1:Global 2:Workspace 3:Remove  Enter:save  Esc:cancel"));
+          helpText.setText(theme.fg("dim", "Type to search · ↑↓ navigate · 1/2/3 change · Enter:save · Esc:cancel"));
         };
 
         refresh();
@@ -1534,27 +1539,27 @@ export default function (pi: ExtensionAPI) {
               if (selected > 0) selected--;
               refresh(); container.invalidate(); tui.requestRender();
             } else if (matchesKey(data, "down")) {
-              if (selected < resources.length - 1) selected++;
+              if (selected < filtered.length - 1) selected++;
               refresh(); container.invalidate(); tui.requestRender();
-            } else if (data === "1") {
-              if (resources.length > 0) {
-                changes.set(resources[selected].id, "global");
+            } else if (data === "1" || data === "2" || data === "3") {
+              const resource = filtered[selected];
+              if (resource) {
+                const state: ResourceState = data === "1" ? "global" : data === "2" ? "workspace" : "removed";
+                changes.set(resource.id, state);
+                refresh();
+                container.invalidate();
               }
-              refresh(); container.invalidate(); tui.requestRender();
-            } else if (data === "2") {
-              if (resources.length > 0) {
-                changes.set(resources[selected].id, "workspace");
-              }
-              refresh(); container.invalidate(); tui.requestRender();
-            } else if (data === "3") {
-              if (resources.length > 0) {
-                changes.set(resources[selected].id, "removed");
-              }
-              refresh(); container.invalidate(); tui.requestRender();
+              tui.requestRender();
             } else if (matchesKey(data, "enter")) {
               done(true);
             } else if (matchesKey(data, "escape")) {
               done(false);
+            } else {
+              searchInput.handleInput(data);
+              selected = 0;
+              refresh();
+              container.invalidate();
+              tui.requestRender();
             }
           },
         };

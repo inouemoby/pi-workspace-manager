@@ -96,7 +96,8 @@ Each plugin has three mutually exclusive states:
 
 | Key | Action |
 |-----|--------|
-| ↑↓ | Navigate |
+| Type | Filter plugins, skills, and themes by name or path |
+| ↑↓ | Navigate filtered results |
 | 1 | Set to Global |
 | 2 | Set to Workspace |
 | 3 | Set to Remove |
