@@ -31,7 +31,7 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 | Command | Description |
 |---------|-------------|
 | `/plugins` | Plugin management panel — view and toggle plugins across all workspaces |
-| `/wm-settings` | Searchable settings list for Reload, Compact, and Codex system retries |
+| `/wm-settings` | Searchable settings list for Reload, Compact, Codex retries, and Codemode mode |
 | `/update` | Update pi to the latest version, with real-time progress output |
 
 ### Empty Enter recovery
@@ -47,15 +47,17 @@ Opens a single searchable settings list, following pi's native settings interact
 - **Reload** — enable or disable the Pi restart tool
 - **Compact** — enable or disable the context compaction tool, and configure its threshold and retries
 - **Codex system retry** — promote any `openai-codex` assistant error to Pi's native retry path and set the extension retry cap
+- **Codemode mode** — choose `off`, `on` (direct and scripted tool calls), or `only` (route active tool calls through scripts). Mode changes require `/reload` to update tool visibility.
 
 Pi handles retry scheduling, backoff, cancellation, and its global retry limit. After three matching image-request failures during one agent run with image-bearing history, the next retry omits historical images from the outbound context; the persisted transcript is never rewritten.
 
-Changes are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json` and applied to the active tool list immediately.
+Settings are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json`. Tool activation changes apply immediately; Codemode's `on`/`only` request-loadout behavior takes effect after `/reload`.
 
 Defaults:
 
 ```json
 {
+  "codemode": { "mode": "on" },
   "reload": { "enabled": true },
   "compact": {
     "enabled": true,

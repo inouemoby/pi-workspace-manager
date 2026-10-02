@@ -67,7 +67,12 @@ const WT = "wt.exe";
 const CMD = "cmd.exe";
 const MANAGER_CONFIG_KEY = "pi-workspace-manager";
 
+type CodemodeManagerMode = "off" | "on" | "only";
+
 interface WorkspaceManagerConfig {
+  codemode: {
+    mode: CodemodeManagerMode;
+  };
   reload: {
     enabled: boolean;
   };
@@ -99,6 +104,7 @@ interface ReloadRecoveryMarker {
 }
 
 const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
+  codemode: { mode: "on" },
   reload: { enabled: true },
   compact: {
     enabled: true,
@@ -148,7 +154,13 @@ function loadManagerConfig(): WorkspaceManagerConfig {
   const raw = settings[MANAGER_CONFIG_KEY] ?? {};
   const rawReload = raw.reload ?? {};
   const rawCompact = raw.compact ?? {};
+  const configuredCodemodeMode = raw.codemode?.mode;
+  const codemodeMode: CodemodeManagerMode = configuredCodemodeMode === "off" ||
+    configuredCodemodeMode === "on" || configuredCodemodeMode === "only"
+    ? configuredCodemodeMode
+    : settings.codemode?.mode === "only" ? "only" : DEFAULT_MANAGER_CONFIG.codemode.mode;
   return {
+    codemode: { mode: codemodeMode },
     reload: {
       enabled: typeof rawReload.enabled === "boolean" ? rawReload.enabled : DEFAULT_MANAGER_CONFIG.reload.enabled,
     },
@@ -180,6 +192,21 @@ function saveManagerConfig(config: WorkspaceManagerConfig): void {
   const settings = readJson(settingsPath);
   settings[MANAGER_CONFIG_KEY] = config;
   writeJson(settingsPath, settings);
+}
+
+function savePiCodemodeMode(mode: Exclude<CodemodeManagerMode, "off">, cwd: string): void {
+  const settingsPath = join(PI_AGENT, "settings.json");
+  const settings = readJson(settingsPath);
+  settings.codemode = { ...(settings.codemode ?? {}), mode };
+  writeJson(settingsPath, settings);
+
+  const projectPath = join(cwd, ".pi", "settings.json");
+  if (!existsSync(projectPath)) return;
+  const projectSettings = readJson(projectPath);
+  if (projectSettings.codemode && typeof projectSettings.codemode === "object") {
+    projectSettings.codemode = { ...projectSettings.codemode, mode };
+    writeJson(projectPath, projectSettings);
+  }
 }
 
 function sessionDirToCwd(dir: string): string {
@@ -892,9 +919,8 @@ export default function (pi: ExtensionAPI) {
     else active.delete("pi_reload");
     if (managerConfig.compact.enabled) active.add("pi_compact");
     else active.delete("pi_compact");
-    // Codemode is an opt-in built-in tool in Pi; keep it available whenever
-    // workspace-manager is loaded so scripts can orchestrate other tools.
-    active.add("codemode");
+    if (managerConfig.codemode.mode === "off") active.delete("codemode");
+    else active.add("codemode");
     pi.setActiveTools([...active]);
   };
 
@@ -1647,7 +1673,7 @@ export default function (pi: ExtensionAPI) {
   // ═══════════════════════════════════════════════════════════
 
   pi.registerCommand("wm-settings", {
-    description: "Manage pi_reload and pi_compact",
+    description: "Manage workspace-manager tools and retry settings",
     handler: async (_args, ctx) => {
       if (ctx.mode !== "tui") {
         ctx.ui.notify("/wm-settings requires TUI mode", "error");
@@ -1756,6 +1782,13 @@ export default function (pi: ExtensionAPI) {
             currentValue: String(managerConfig.codexRetry.maxRetries),
             submenu: (currentValue, finish) => createValueSubmenu("Maximum Codex retries", retryValues, currentValue, finish),
           },
+          {
+            id: "codemode.mode",
+            label: "Codemode · mode",
+            description: "off disables Codemode; on allows direct and scripted tool calls; only routes active tools through scripts. Run /reload after changing the mode.",
+            currentValue: managerConfig.codemode.mode,
+            values: ["off", "on", "only"],
+          },
         ];
 
         const container = new Container();
@@ -1791,9 +1824,15 @@ export default function (pi: ExtensionAPI) {
               case "codexRetry.maxRetries":
                 managerConfig.codexRetry.maxRetries = Number.parseInt(value, 10);
                 break;
+              case "codemode.mode":
+                managerConfig.codemode.mode = value as CodemodeManagerMode;
+                if (value !== "off") savePiCodemodeMode(value as "on" | "only", ctx.cwd);
+                break;
             }
             persistManagerConfig();
-            ctx.ui.notify(`Saved ${id}: ${value}`, "info");
+            ctx.ui.notify(id === "codemode.mode"
+              ? `Saved Codemode mode: ${value}. Run /reload to apply the tool visibility mode.`
+              : `Saved ${id}: ${value}`, "info");
             tui.requestRender();
           },
           () => done(undefined),
