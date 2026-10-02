@@ -18,10 +18,11 @@ On first session start, automatically:
 4. Scans all workspace `.pi/` directories and registers local resources
 5. Removes invalid plugin registrations (files that no longer exist)
 6. Exposes `pi_compact` to compact conversation context
-7. Provides `/wm-settings` to manage Reload, Compact, and Codex system retries
-8. Promotes any OpenAI Codex assistant error to Pi's native retry path; repeated image-request failures retain the image-stripping fallback
-9. Forces direct Google Gemini API requests to use the Flex inference tier
-10. Resumes unfinished turns on empty Enter while idle, without a new user prompt
+7. Enables Pi's `codemode` tool by default so scripts can orchestrate tools
+8. Provides `/wm-settings` to manage Reload, Compact, and Codex system retries
+9. Promotes any OpenAI Codex assistant error to Pi's native retry path; repeated image-request failures retain the image-stripping fallback
+10. Forces direct Google Gemini API requests to use the Flex inference tier
+11. Resumes unfinished turns on empty Enter while idle, without a new user prompt
 
 This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference when the selected model is on Google's published Flex-supported list; unsupported models, Antigravity, and other providers are not modified.
 
@@ -123,6 +124,10 @@ Compacts conversation context.
 ### `pi_reload`
 
 Restarts Pi and resumes the current session.
+
+### Codemode
+
+When this extension starts a session, it enables Pi's built-in `codemode` tool by default. No separate `defaultTools` setting is needed; Pi's sandbox and tool-call restrictions still apply.
 
 ## Design Notes
 

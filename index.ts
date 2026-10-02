@@ -834,6 +834,9 @@ export default function (pi: ExtensionAPI) {
     else active.delete("pi_reload");
     if (managerConfig.compact.enabled) active.add("pi_compact");
     else active.delete("pi_compact");
+    // Codemode is an opt-in built-in tool in Pi; keep it available whenever
+    // workspace-manager is loaded so scripts can orchestrate other tools.
+    active.add("codemode");
     pi.setActiveTools([...active]);
   };
 
