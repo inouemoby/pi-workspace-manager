@@ -23,6 +23,7 @@ On first session start, automatically:
 9. Promotes any OpenAI Codex assistant error to Pi's native retry path; repeated image-request failures retain the image-stripping fallback
 10. Forces direct Google Gemini API requests to use the Flex inference tier
 11. Resumes unfinished turns on empty Enter while idle, without a new user prompt
+12. Shows one completion timestamp per model turn, on that turn's final block
 
 This ensures every installed plugin is tracked and manageable through the `/plugins` panel. Direct `google` provider requests using the `google-generative-ai` API are sent with Flex inference when the selected model is on Google's published Flex-supported list; unsupported models, Antigravity, and other providers are not modified.
 
@@ -31,8 +32,18 @@ This ensures every installed plugin is tracked and manageable through the `/plug
 | Command | Description |
 |---------|-------------|
 | `/plugins` | Plugin management panel — view and toggle plugins across all workspaces |
-| `/wm-settings` | Searchable settings list for Reload, Compact, Codex retries, and Codemode mode |
+| `/wm-settings` | Searchable settings for timestamps, Reload, Compact, Codex retries, and Codemode mode |
 | `/update` | Update pi to the latest version, with real-time progress output |
+
+### Model-turn timestamps
+
+Enabled by default. **One timestamp per model turn**, not per tool call or user message: Pi's `turn_end` boundary runs after the assistant response and its entire tool batch, before the next model request can start. This also includes intermediate turns while the overall task is still working, as well as a final tool-free reply.
+
+The time is right-aligned on the turn's **last block**, always on its dedicated bottom-most row. For a tool batch, only the final tool in display order is stamped—even when parallel tools finish in a different order. The stamp uses the native frame's bottom padding; custom shells without padding get a dedicated footer inside their shell. `Took`/elapsed/duration output is preserved in place and never merged with the timestamp. Tool-free replies likewise show a bottom row below the assistant text. User messages, hidden controls, and individual tool completions do not get separate stamps.
+
+Today's stamps show local `HH:mm:ss`; other dates show `YYYY-MM-DD HH:mm:ss`. `/wm-settings` → **时间戳 · 模型轮次完成时间** switches between **显示** and **不显示**, applying immediately. Completion times are private session metadata, never model messages. Old per-tool records are grouped into one stamp per turn; records without metadata use Pi's saved message/result times. Labels recalculate on rendering and refresh at local midnight.
+
+This is a plugin-only, reversible in-memory adapter around Pi's exported TUI classes (tested on Pi 1.0.4). It preserves native block bodies and Working, changes no tool execution or model input, and modifies no Pi client files. The adapter is removed when the extension shuts down.
 
 ### Empty Enter recovery
 
@@ -44,6 +55,7 @@ The extension triggers the turn with an **invisible, empty custom marker** and r
 
 Opens a single searchable settings list, following pi's native settings interaction. Type to filter settings; toggles change directly, while numeric settings open a selectable submenu instead of cycling values with repeated Enter presses.
 
+- **Model-turn timestamps** — show or hide one completion time per assistant/tool round, applying immediately
 - **Reload** — enable or disable the Pi restart tool
 - **Compact** — enable or disable the context compaction tool, and configure its threshold and retries
 - **Codex system retry** — promote any `openai-codex` assistant error to Pi's native retry path and set the extension retry cap
@@ -58,6 +70,7 @@ Defaults:
 ```json
 {
   "codemode": { "mode": "on" },
+  "timestamps": { "enabled": true },
   "reload": { "enabled": true },
   "compact": {
     "enabled": true,

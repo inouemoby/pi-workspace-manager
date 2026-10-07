@@ -7,11 +7,14 @@
  * 4. Guarded model-triggered context compaction with automatic task continuation
  */
 
-import { CustomEditor, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import {
+  AssistantMessageComponent, ToolExecutionComponent, InteractiveMode,
+  CustomEditor, type ExtensionAPI, type ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
   Container, Input, type SelectItem, SelectList,
-  type SettingItem, SettingsList, Text, matchesKey,
+  type SettingItem, SettingsList, Text, matchesKey, visibleWidth, truncateToWidth, sliceByColumn, stripTerminalSequences,
 } from "@earendil-works/pi-tui";
 import { DynamicBorder, getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { basename, dirname, join, resolve } from "node:path";
@@ -58,6 +61,125 @@ export function withoutRecoveryMarkers(messages: readonly any[]): readonly any[]
   return filtered;
 }
 
+const TIMESTAMP_ENTRY = "pi-workspace-manager:interaction-times";
+
+export function turnTimestampTarget(message: any): string | undefined {
+  if (message?.role !== "assistant" || !Number.isFinite(message.timestamp)) return undefined;
+  const calls = (message.content ?? []).filter((block: any) => block.type === "toolCall");
+  return calls.length ? `tool:${calls.at(-1).id}` : `assistant:${message.timestamp}`;
+}
+
+export function formatInteractionTime(timestamp: number, now = new Date()): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(date.getTime())) return "";
+  const two = (value: number) => String(value).padStart(2, "0");
+  const time = `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())}`;
+  const today = date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() && date.getDate() === now.getDate();
+  return today ? time : `${date.getFullYear()}-${two(date.getMonth() + 1)}-${two(date.getDate())} ${time}`;
+}
+
+export function appendInteractionTime(lines: string[], width: number, timestamp: number,
+  color: (text: string) => string, now = new Date(), padding = 1): string[] {
+  if (!lines.length || width < 1) return lines;
+  const label = formatInteractionTime(timestamp, now);
+  if (!label) return lines;
+  const rightPad = Math.min(Math.max(0, padding), Math.max(0, width - 8));
+  const fitted = truncateToWidth(label, width - rightPad, "");
+  const row = " ".repeat(Math.max(0, width - rightPad - visibleWidth(fitted))) + color(fitted) + " ".repeat(rightPad);
+  return [...lines, row];
+}
+
+export function putInteractionTimeInTool(lines: string[], width: number, timestamp: number,
+  color: (text: string) => string, now = new Date(), padding = 1): string[] {
+  if (!lines.length || width < 1) return lines;
+  const label = formatInteractionTime(timestamp, now);
+  if (!label) return lines;
+  const rendered = [...lines];
+  const last = rendered.at(-1)!;
+  // Always use a dedicated bottom row. Took/elapsed text is ordinary native
+  // output and must never share the clock row or affect its placement.
+  if (stripTerminalSequences(last).trim()) {
+    // A custom shell may have no bottom padding. Add a footer INSIDE that
+    // shell, inheriting the last row's SGR style but no hyperlinks/image data.
+    const style = sliceByColumn(last, 0, 1).match(/\x1b\[[0-9;:]*m/g)?.join("") ?? "";
+    rendered.push(style + " ".repeat(width) + "\x1b[0m");
+  }
+  const index = rendered.length - 1;
+  const rightPad = Math.min(Math.max(0, padding), Math.max(0, width - 8));
+  const fitted = truncateToWidth(label, width - rightPad, "");
+  const start = width - rightPad - visibleWidth(fitted);
+  const prefix = sliceByColumn(rendered[index], 0, start, true);
+  const suffix = sliceByColumn(rendered[index], start + visibleWidth(fitted), rightPad, true);
+  rendered[index] = prefix + " ".repeat(Math.max(0, start - visibleWidth(prefix))) + color(fitted) +
+    suffix + " ".repeat(Math.max(0, rightPad - visibleWidth(suffix))) + "\x1b[0m";
+  return rendered;
+}
+
+// Pi exposes these TUI classes but no general message-decoration hook. Keep a
+// small, reversible, in-memory rendering adapter: no client files, messages or
+// provider inputs are changed, and native renderers always draw the body first.
+export function installInteractionTimestampRenderers(options: {
+  enabled: () => boolean;
+  timeFor: (key: string, fallback?: number) => number | undefined;
+  color: (text: string) => string;
+}) {
+  let active = true;
+  let mode: any;
+  const undo: (() => void)[] = [];
+  const withTime = (component: any, lines: string[], width: number, at?: number): string[] =>
+    active && options.enabled() && at !== undefined
+      ? appendInteractionTime(lines, width, at, options.color, new Date(), component.outputPad ?? 1)
+      : lines;
+  const patch = (prototype: any, name: string, wrap: (original: any) => any) => {
+    const original = prototype[name];
+    if (typeof original !== "function") throw new Error(`Pi timestamp renderer requires ${name}`);
+    const replacement = wrap(original);
+    prototype[name] = replacement;
+    undo.push(() => { if (prototype[name] === replacement) prototype[name] = original; });
+  };
+  patch(AssistantMessageComponent.prototype, "render", (original) => function (this: any, width: number) {
+    const lines = original.call(this, width);
+    const message = this.lastMessage;
+    if (this.isStreaming || !message) return lines;
+    return withTime(this, lines, width, options.timeFor(`assistant:${message.timestamp}`));
+  });
+  patch(ToolExecutionComponent.prototype, "render", (original) => function (this: any, width: number) {
+    if (!active || !options.enabled() || !this.result || this.isPartial) return original.call(this, width);
+    const at = options.timeFor(`tool:${this.toolCallId}`);
+    if (at === undefined) return original.call(this, width);
+    // Decorate the text shell, not the outer tool component: preserve native
+    // background/padding and keep image output below the timestamp footer.
+    const shell = this.hasRendererDefinition()
+      ? this.getRenderShell() === "self" ? this.selfRenderContainer : this.contentBox
+      : this.contentText;
+    if (!shell || typeof shell.render !== "function") return original.call(this, width);
+    const renderShell = shell.render;
+    shell.render = function (shellWidth: number) {
+      return putInteractionTimeInTool(renderShell.call(this, shellWidth), shellWidth, at, options.color);
+    };
+    try { return original.call(this, width); }
+    finally { shell.render = renderShell; }
+  });
+  patch(InteractiveMode.prototype, "addMessageToChat", (original) => function (this: any, ...args: any[]) {
+    mode = this; // Capture Pi's own render invalidation path; do not annotate user/control messages.
+    return original.apply(this, args);
+  });
+  return {
+    refresh() {
+      mode?.ui?.invalidate();
+      mode?.ui?.requestRender();
+    },
+    uninstall() {
+      active = false;
+      for (const restore of undo.reverse()) restore();
+      mode?.ui?.invalidate();
+      mode?.ui?.requestRender();
+      mode = undefined;
+    },
+  };
+}
+
 const HOME = homedir();
 const PI_AGENT = join(HOME, ".pi", "agent");
 const SESSIONS_DIR = join(PI_AGENT, "sessions");
@@ -87,6 +209,9 @@ interface WorkspaceManagerConfig {
     enabled: boolean;
     maxRetries: number;
   };
+  timestamps: {
+    enabled: boolean;
+  };
 }
 
 interface PendingCompactRequest {
@@ -105,6 +230,7 @@ interface ReloadRecoveryMarker {
 
 const DEFAULT_MANAGER_CONFIG: WorkspaceManagerConfig = {
   codemode: { mode: "on" },
+  timestamps: { enabled: true },
   reload: { enabled: true },
   compact: {
     enabled: true,
@@ -161,6 +287,9 @@ function loadManagerConfig(): WorkspaceManagerConfig {
     : settings.codemode?.mode === "only" ? "only" : DEFAULT_MANAGER_CONFIG.codemode.mode;
   return {
     codemode: { mode: codemodeMode },
+    timestamps: {
+      enabled: typeof raw.timestamps?.enabled === "boolean" ? raw.timestamps.enabled : DEFAULT_MANAGER_CONFIG.timestamps.enabled,
+    },
     reload: {
       enabled: typeof rawReload.enabled === "boolean" ? rawReload.enabled : DEFAULT_MANAGER_CONFIG.reload.enabled,
     },
@@ -906,6 +1035,81 @@ export default function (pi: ExtensionAPI) {
   let compactResumeTimer: ReturnType<typeof setTimeout> | undefined;
   let sessionGeneration = 0;
   let userInputEpoch = 0;
+  let timestampUi: ExtensionContext["ui"] | undefined;
+  let timestampMode = false;
+  let timestampDateTimer: ReturnType<typeof setTimeout> | undefined;
+  const interactionTimes = new Map<string, number>();
+  const createTimestampRenderers = () => installInteractionTimestampRenderers({
+    enabled: () => timestampMode && managerConfig.timestamps.enabled,
+    timeFor: (key) => interactionTimes.get(key),
+    color: (text) => timestampUi?.theme.fg("dim", text) ?? text,
+  });
+  let timestampRenderers: ReturnType<typeof installInteractionTimestampRenderers> | undefined = createTimestampRenderers();
+  const scheduleTimestampDateRefresh = () => {
+    if (timestampDateTimer) clearTimeout(timestampDateTimer);
+    timestampDateTimer = undefined;
+    if (!timestampMode || !managerConfig.timestamps.enabled) return;
+    const midnight = new Date();
+    midnight.setHours(24, 0, 0, 0);
+    timestampDateTimer = setTimeout(() => {
+      timestampDateTimer = undefined;
+      timestampRenderers?.refresh();
+      scheduleTimestampDateRefresh();
+    }, Math.max(1, midnight.getTime() - Date.now() + 10));
+    timestampDateTimer.unref?.();
+  };
+
+  const replayInteractionTimes = (ctx: ExtensionContext) => {
+    interactionTimes.clear();
+    const rounds: any[] = [];
+    const results = new Map<string, number>();
+    const legacyTimes = new Map<string, number>();
+    const turnTimes = new Map<string, number>();
+    for (const entry of ctx.sessionManager.getBranch()) {
+      if (entry.type === "message") {
+        const message = entry.message as any;
+        if (message.role === "assistant") rounds.push(message);
+        else if (message.role === "toolResult" && Number.isFinite(message.timestamp)) results.set(message.toolCallId, message.timestamp);
+      } else if (entry.type === "custom" && entry.customType === TIMESTAMP_ENTRY) {
+        const data = entry.data as { version?: number; times?: { key: string; at: number }[] } | undefined;
+        if (!Array.isArray(data?.times)) continue;
+        const target = data.version === 2 ? turnTimes : legacyTimes;
+        for (const item of data.times) {
+          if (typeof item?.key === "string" && Number.isFinite(item.at)) target.set(item.key, item.at);
+        }
+      }
+    }
+    for (const message of rounds) {
+      const key = turnTimestampTarget(message);
+      if (!key) continue;
+      const calls = (message.content ?? []).filter((block: any) => block.type === "toolCall");
+      const failed = message.stopReason === "aborted" || message.stopReason === "error";
+      if (!turnTimes.has(key) && calls.length && !failed && !calls.every((call: any) => results.has(call.id))) continue;
+      // Old per-tool records are projected as ONE completed round too. The
+      // latest completion time belongs to the last displayed tool block, not
+      // whichever parallel tool happened to finish last.
+      const known = [legacyTimes.get(`assistant:${message.timestamp}`),
+        ...calls.map((call: any) => legacyTimes.get(`tool:${call.id}`) ?? results.get(call.id))]
+        .filter((value): value is number => Number.isFinite(value));
+      interactionTimes.set(key, turnTimes.get(key) ?? (known.length ? Math.max(...known) : message.timestamp));
+    }
+  };
+
+  pi.on("turn_end", (event, ctx) => {
+    if (ctx.mode !== "tui") return;
+    const message = event.message as any;
+    const key = turnTimestampTarget(message);
+    if (!key) return;
+    const at = Date.now();
+    // This boundary runs after the assistant response AND its complete tool
+    // batch, before the loop can submit the next provider request. No timestamp
+    // is emitted by individual message_end/tool_execution_end events.
+    interactionTimes.set(key, at);
+    pi.appendEntry(TIMESTAMP_ENTRY, { version: 2, times: [{ key, at }] });
+    timestampRenderers?.refresh();
+  });
+  pi.on("session_tree", (_event, ctx) => replayInteractionTimes(ctx));
+  pi.on("session_compact", (_event, ctx) => replayInteractionTimes(ctx));
   // These counters only gate promotion to Pi's native retry path and the
   // image-specific fallback. Retry scheduling, backoff, and cancellation stay
   // in Pi's system retry implementation.
@@ -924,9 +1128,11 @@ export default function (pi: ExtensionAPI) {
     pi.setActiveTools([...active]);
   };
 
-  const persistManagerConfig = () => {
+  const persistManagerConfig = (updateTools = true) => {
     saveManagerConfig(managerConfig);
-    applyManagedToolAvailability();
+    if (updateTools) applyManagedToolAvailability();
+    timestampRenderers?.refresh();
+    scheduleTimestampDateRefresh();
   };
 
   const clearPendingCompaction = (request: PendingCompactRequest): boolean => {
@@ -1155,6 +1361,11 @@ export default function (pi: ExtensionAPI) {
     if (pendingCompactRequest) clearPendingCompaction(pendingCompactRequest);
     sessionActive = true;
     sessionGeneration++;
+    timestampMode = ctx.mode === "tui";
+    timestampUi = timestampMode ? ctx.ui : undefined;
+    replayInteractionTimes(ctx);
+    timestampRenderers ??= createTimestampRenderers();
+    scheduleTimestampDateRefresh();
     if (ctx.mode !== "tui") return;
     const previousFactory = ctx.ui.getEditorComponent();
     ctx.ui.setEditorComponent((tui, theme, keybindings) => {
@@ -1727,6 +1938,13 @@ export default function (pi: ExtensionAPI) {
         ])].sort((a, b) => a - b).map((ms) => `${ms} ms`);
         const items: SettingItem[] = [
           {
+            id: "timestamps.enabled",
+            label: "时间戳 · 模型轮次完成时间",
+            description: "本轮回复及全部工具完成后，只在最后一块的底部行右侧显示一次时分秒；非今日额外显示年月日。",
+            currentValue: managerConfig.timestamps.enabled ? "显示" : "不显示",
+            values: ["显示", "不显示"],
+          },
+          {
             id: "reload.enabled",
             label: "Reload · pi_reload tool",
             description: "Enable or disable Pi restart.",
@@ -1800,6 +2018,9 @@ export default function (pi: ExtensionAPI) {
           getSettingsListTheme(),
           (id, value) => {
             switch (id) {
+              case "timestamps.enabled":
+                managerConfig.timestamps.enabled = value === "显示";
+                break;
               case "reload.enabled":
                 managerConfig.reload.enabled = value === "enabled";
                 break;
@@ -1829,7 +2050,7 @@ export default function (pi: ExtensionAPI) {
                 if (value !== "off") savePiCodemodeMode(value as "on" | "only", ctx.cwd);
                 break;
             }
-            persistManagerConfig();
+            persistManagerConfig(id !== "timestamps.enabled");
             ctx.ui.notify(id === "codemode.mode"
               ? `Saved Codemode mode: ${value}. Run /reload to apply the tool visibility mode.`
               : `Saved ${id}: ${value}`, "info");
@@ -2198,6 +2419,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
+    timestampMode = false;
+    timestampUi = undefined;
+    if (timestampDateTimer) clearTimeout(timestampDateTimer);
+    timestampDateTimer = undefined;
+    timestampRenderers?.uninstall();
+    timestampRenderers = undefined;
+    interactionTimes.clear();
     sessionActive = false;
     codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;

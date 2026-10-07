@@ -62,6 +62,7 @@ test('Pi sendCustomMessage marks the agent busy before another prompt can start'
     followUp: (message) => queued.push(message),
   };
   session._recordSelection = () => {};
+  session._pendingToolNames = new Set();
   session._handlePostAgentRun = async () => false;
   session._runBeforeSettleBoundary = async () => false;
   session._flushPendingBashMessages = () => {};
