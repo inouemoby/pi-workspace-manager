@@ -119,10 +119,17 @@ export function putInteractionTimeInTool(lines: string[], width: number, timesta
 // Pi exposes these TUI classes but no general message-decoration hook. Keep a
 // small, reversible, in-memory rendering adapter: no client files, messages or
 // provider inputs are changed, and native renderers always draw the body first.
+interface ShellTiming {
+  ms: number;
+  endedAt: number;
+}
+
 export function installInteractionTimestampRenderers(options: {
   enabled: () => boolean;
   timeFor: (key: string, fallback?: number) => number | undefined;
   color: (text: string) => string;
+  shellTimingFor?: (toolCallId: string) => ShellTiming | undefined;
+  rememberShellTiming?: (toolCallId: string, timing: ShellTiming) => void;
 }) {
   let active = true;
   let mode: any;
@@ -143,6 +150,28 @@ export function installInteractionTimestampRenderers(options: {
     const message = this.lastMessage;
     if (this.isStreaming || !message) return lines;
     return withTime(this, lines, width, options.timeFor(`assistant:${message.timestamp}`));
+  });
+  patch(ToolExecutionComponent.prototype, "updateResult", (original) => function (this: any, result: any, isPartial = false) {
+    const shell = this.toolName === "bash" || this.toolName === "powershell";
+    const state = this.rendererState;
+    if (active && shell && state && !isPartial && state.startedAt === undefined) {
+      // Native shell renderers generate Took only when startedAt is present.
+      // Rebuilt history frames never receive markExecutionStarted(). Restore
+      // display timing from saved data, WITHOUT marking an execution as started.
+      const saved = options.shellTimingFor?.(this.toolCallId);
+      const seconds = result?.structuredContent?.wall_time_seconds;
+      const ms = saved?.ms ?? (typeof seconds === "number" && Number.isFinite(seconds) && seconds >= 0 ? seconds * 1000 : undefined);
+      const endedAt = saved?.endedAt ?? (Number.isFinite(result?.timestamp) ? result.timestamp : Date.now());
+      if (ms !== undefined && Number.isFinite(ms) && ms >= 0 && Number.isFinite(endedAt)) {
+        state.startedAt = endedAt - ms;
+        state.endedAt = endedAt;
+      }
+    }
+    const updated = original.call(this, result, isPartial);
+    if (active && shell && !isPartial && Number.isFinite(state?.startedAt) && Number.isFinite(state?.endedAt)) {
+      options.rememberShellTiming?.(this.toolCallId, { ms: Math.max(0, state.endedAt - state.startedAt), endedAt: state.endedAt });
+    }
+    return updated;
   });
   patch(ToolExecutionComponent.prototype, "render", (original) => function (this: any, width: number) {
     if (!active || !options.enabled() || !this.result || this.isPartial) return original.call(this, width);
@@ -1039,10 +1068,13 @@ export default function (pi: ExtensionAPI) {
   let timestampMode = false;
   let timestampDateTimer: ReturnType<typeof setTimeout> | undefined;
   const interactionTimes = new Map<string, number>();
+  const shellTimings = new Map<string, ShellTiming>();
   const createTimestampRenderers = () => installInteractionTimestampRenderers({
     enabled: () => timestampMode && managerConfig.timestamps.enabled,
     timeFor: (key) => interactionTimes.get(key),
     color: (text) => timestampUi?.theme.fg("dim", text) ?? text,
+    shellTimingFor: (id) => shellTimings.get(id),
+    rememberShellTiming: (id, timing) => shellTimings.set(id, timing),
   });
   let timestampRenderers: ReturnType<typeof installInteractionTimestampRenderers> | undefined = createTimestampRenderers();
   const scheduleTimestampDateRefresh = () => {
@@ -1061,6 +1093,7 @@ export default function (pi: ExtensionAPI) {
 
   const replayInteractionTimes = (ctx: ExtensionContext) => {
     interactionTimes.clear();
+    shellTimings.clear();
     const rounds: any[] = [];
     const results = new Map<string, number>();
     const legacyTimes = new Map<string, number>();
@@ -1071,7 +1104,15 @@ export default function (pi: ExtensionAPI) {
         if (message.role === "assistant") rounds.push(message);
         else if (message.role === "toolResult" && Number.isFinite(message.timestamp)) results.set(message.toolCallId, message.timestamp);
       } else if (entry.type === "custom" && entry.customType === TIMESTAMP_ENTRY) {
-        const data = entry.data as { version?: number; times?: { key: string; at: number }[] } | undefined;
+        const data = entry.data as { version?: number; times?: { key: string; at: number }[];
+          shellTimings?: { id: string; ms: number; endedAt: number }[] } | undefined;
+        if (Array.isArray(data?.shellTimings)) {
+          for (const item of data.shellTimings) {
+            if (typeof item?.id === "string" && Number.isFinite(item.ms) && item.ms >= 0 && Number.isFinite(item.endedAt)) {
+              shellTimings.set(item.id, { ms: item.ms, endedAt: item.endedAt });
+            }
+          }
+        }
         if (!Array.isArray(data?.times)) continue;
         const target = data.version === 2 ? turnTimes : legacyTimes;
         for (const item of data.times) {
@@ -1105,7 +1146,13 @@ export default function (pi: ExtensionAPI) {
     // batch, before the loop can submit the next provider request. No timestamp
     // is emitted by individual message_end/tool_execution_end events.
     interactionTimes.set(key, at);
-    pi.appendEntry(TIMESTAMP_ENTRY, { version: 2, times: [{ key, at }] });
+    const timingRecords = (message.content ?? []).filter((block: any) => block.type === "toolCall")
+      .flatMap((block: any) => {
+        const timing = shellTimings.get(block.id);
+        return timing ? [{ id: block.id, ...timing }] : [];
+      });
+    pi.appendEntry(TIMESTAMP_ENTRY, { version: 2, times: [{ key, at }],
+      ...(timingRecords.length ? { shellTimings: timingRecords } : {}) });
     timestampRenderers?.refresh();
   });
   pi.on("session_tree", (_event, ctx) => replayInteractionTimes(ctx));
@@ -2426,6 +2473,7 @@ export default function (pi: ExtensionAPI) {
     timestampRenderers?.uninstall();
     timestampRenderers = undefined;
     interactionTimes.clear();
+    shellTimings.clear();
     sessionActive = false;
     codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;

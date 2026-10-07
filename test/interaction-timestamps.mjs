@@ -16,6 +16,17 @@ const { formatInteractionTime, appendInteractionTime, putInteractionTimeInTool, 
 const chunk = files.find((n) => n.endsWith('.js') && readFileSync(join(chunksDir, n), 'utf8').includes('async _runAgentPrompt(messages){'));
 const { discoverAndLoadExtensions, SessionManager } = await import(pathToFileURL(join(chunksDir, chunk)).href);
 sdk.initTheme('dark', false);
+// Use Pi's ACTUAL shell renderers, not a fixture Text('Took ...'). They own
+// startedAt/endedAt and therefore expose live-vs-rebuilt history regressions.
+const distDir = join(chunksDir, '..', '..');
+const nativeSdk = await import(pathToFileURL(join(distDir, 'index.js')).href);
+nativeSdk.initTheme('dark', false);
+const { createShellRenderers } = await import(pathToFileURL(join(distDir, 'core', 'tools', 'renderers', 'bash.js')).href);
+function nativeShell(id, name = 'bash') {
+  const definition = { ...sdk.createBashTool(pluginDir), ...createShellRenderers(name === 'powershell' ? 'PS>' : '$') };
+  return new sdk.ToolExecutionComponent(name, id, { command: 'echo ok' }, { showImages: false }, definition, { requestRender() {} }, pluginDir);
+}
+const renderedText = (component) => component.render(70).map(tui.stripTerminalSequences).join('\n');
 
 const at = new Date(2026, 9, 3, 9, 7, 45).getTime();
 const today = new Date(2026, 9, 3, 20, 0);
@@ -137,6 +148,95 @@ test('renderer adds only explicitly selected completed timestamps; streaming and
     assert.deepEqual(assistant.render(50), assistantBody);
   } finally { adapter.uninstall(); }
   assert.equal(sdk.ToolExecutionComponent.prototype.render, original);
+});
+
+test('real native shell Took survives timestamp rendering, invalidation, and disabling the clock', () => {
+  const native = nativeShell('native-live');
+  const originalNow = Date.now;
+  let enabled = true;
+  const timings = new Map();
+  const adapter = installInteractionTimestampRenderers({
+    enabled: () => enabled, timeFor: () => 1400, color: (text) => text,
+    shellTimingFor: (id) => timings.get(id), rememberShellTiming: (id, timing) => timings.set(id, timing),
+  });
+  try {
+    Date.now = () => 1000;
+    native.markExecutionStarted();
+    Date.now = () => 1400;
+    native.updateResult({ content: [{ type: 'text', text: 'ok' }], structuredContent: { wall_time_seconds: 0.3 }, timestamp: 1400 });
+    // Native UI duration (0.4s) takes precedence over process wall time (0.3s).
+    assert.match(renderedText(native), /Took 0\.4s/);
+    assert.deepEqual(timings.get('native-live'), { ms: 400, endedAt: 1400 });
+    native.invalidate();
+    assert.match(renderedText(native), /Took 0\.4s/);
+    enabled = false;
+    assert.match(renderedText(native), /Took 0\.4s/);
+    assert.equal(native.executionStarted, true);
+  } finally { Date.now = originalNow; adapter.uninstall(); }
+});
+
+test('rebuilt bash and powershell frames recover Took from genuine saved wall time, without starting execution', () => {
+  const adapter = installInteractionTimestampRenderers({ enabled: () => true, timeFor: () => 1400, color: (text) => text });
+  try {
+    for (const name of ['bash', 'powershell']) {
+      const rebuilt = nativeShell('rebuilt-' + name, name);
+      rebuilt.updateResult({ content: [{ type: 'text', text: 'ok' }], structuredContent: { wall_time_seconds: 0.4 }, timestamp: 1400 });
+      assert.match(renderedText(rebuilt), /Took 0\.4s/);
+      assert.equal(rebuilt.executionStarted, false, 'restoring rendering data is not an execution-start event');
+      const noData = nativeShell('no-data-' + name, name);
+      noData.updateResult({ content: [{ type: 'text', text: 'ok' }] });
+      assert.doesNotMatch(renderedText(noData), /Took/, 'never invent an unknown duration');
+    }
+  } finally { adapter.uninstall(); }
+});
+
+test('timing restoration chains another plugin’s updateResult wrapper and restores it when unloaded', () => {
+  const prototype = sdk.ToolExecutionComponent.prototype;
+  const nativeUpdate = prototype.updateResult;
+  let calls = 0;
+  const otherPlugin = function (...args) { calls++; return nativeUpdate.apply(this, args); };
+  prototype.updateResult = otherPlugin;
+  const adapter = installInteractionTimestampRenderers({ enabled: () => false, timeFor: () => undefined, color: (text) => text });
+  try {
+    const component = nativeShell('other-plugin');
+    component.updateResult({ content: [{ type: 'text', text: 'ok' }], structuredContent: { wall_time_seconds: 0.2 }, timestamp: 3000 });
+    assert.equal(calls, 1);
+    assert.match(renderedText(component), /Took 0\.2s/);
+    adapter.uninstall();
+    assert.equal(prototype.updateResult, otherPlugin);
+  } finally {
+    adapter.uninstall();
+    if (prototype.updateResult === otherPlugin) prototype.updateResult = nativeUpdate;
+  }
+});
+
+test('native shell timing persists in private metadata and is replayed after reload', async () => {
+  const h = await setup();
+  try {
+    const message = { role: 'assistant', timestamp: 1000, stopReason: 'toolUse', content: [{ type: 'toolCall', id: 'saved-shell', name: 'bash', arguments: { command: 'echo ok' } }] };
+    const result = { role: 'toolResult', toolCallId: 'saved-shell', toolName: 'bash', timestamp: 1400,
+      content: [{ type: 'text', text: 'ok' }], structuredContent: { wall_time_seconds: 0.4 } };
+    h.manager.appendMessage(message);
+    h.manager.appendMessage(result);
+    const before = h.manager.buildSessionProjection().messages;
+    const component = nativeShell('saved-shell');
+    component.updateResult(result);
+    assert.match(renderedText(component), /Took 0\.4s/);
+    await h.finish(message, [result]);
+    assert.deepEqual(h.records[0].data.shellTimings, [{ id: 'saved-shell', ms: 400, endedAt: 1400 }]);
+    assert.deepEqual(h.manager.buildSessionProjection().messages, before);
+    await h.close();
+    await h.ext.handlers.get('session_start')[0]({ reason: 'reload' }, h.ctx);
+    const restored = nativeShell('saved-shell');
+    // Saved private UI timing also covers results without a wall_time field.
+    restored.updateResult({ content: [{ type: 'text', text: 'ok' }], timestamp: 1400 });
+    assert.match(renderedText(restored), /Took 0\.4s/);
+    assert.equal(restored.executionStarted, false);
+    const lines = restored.render(70).map(tui.stripTerminalSequences);
+    const tookIndex = lines.findIndex((line) => line.includes('Took 0.4s'));
+    assert.ok(tookIndex >= 0 && tookIndex < lines.length - 1);
+    assert.match(lines.at(-1).trim(), /\d{2}:\d{2}:\d{2}$/);
+  } finally { await h.close(); }
 });
 
 test('user messages, summaries and hidden controls are not separate model rounds', () => {
