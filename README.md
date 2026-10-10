@@ -58,10 +58,10 @@ Opens a single searchable settings list, following pi's native settings interact
 - **Model-turn timestamps** — show or hide one completion time per assistant/tool round, applying immediately
 - **Reload** — enable or disable the Pi restart tool
 - **Compact** — enable or disable the context compaction tool, and configure its threshold and retries
-- **Codex system retry** — promote any `openai-codex` assistant error to Pi's native retry path and set the extension retry cap
+- **Codex system retry** — promote `openai-codex` assistant errors to Pi's native retry path and set the actual Codex retry cap
 - **Codemode mode** — choose `off`, `on` (direct and scripted tool calls), or `only` (route active tool calls through scripts). Mode changes require `/reload` to update tool visibility.
 
-Pi handles retry scheduling, backoff, cancellation, and its global retry limit. After three matching image-request failures during one agent run with image-bearing history, the next retry omits historical images from the outbound context; the persisted transcript is never rewritten.
+Pi handles retry scheduling, counters, backoff, cancellation, and retry progress. WM supplies the actual message-level cap for Codex only; setting it to 10 allows ten additional native attempts, not a separate WM counter capped by Pi's default 3. The misleading pre-scheduling warning is removed: Pi's `auto_retry_start` progress is authoritative. After three matching image-request failures with image-bearing history, the next request omits historical images; this does not reset the total native retry budget.
 
 Settings are persisted under `pi-workspace-manager` in `~/.pi/agent/settings.json`. Tool activation changes apply immediately; Codemode's `on`/`only` request-loadout behavior takes effect after `/reload`.
 
@@ -86,7 +86,9 @@ Defaults:
 }
 ```
 
-`compact.maxRetries` counts additional attempts after the initial compaction. `codexRetry.maxRetries` gates how many Codex assistant errors this extension promotes; Pi's global `retry.maxRetries` remains an additional upper bound. Cancellation and exhausted retry budgets still stop retries.
+`compact.maxRetries` counts additional attempts after the initial compaction. `codexRetry.maxRetries` is Codex's actual native retry limit after the initial request. `retry.enabled: false` still disables automatic retries, and native delay settings remain unchanged. Other providers, summarization and provider-level HTTP retries retain Pi's own settings. Disabling WM's Codex retry feature restores Pi's ordinary retry policy.
+
+A reversible in-memory adapter (tested on Pi 1.1.0) supplies this cap only while Pi's native retry entry points synchronously read their policy. The settings getter is restored before backoff begins. It changes no Pi client file or persistent `retry` setting, never starts a parallel retry loop, and adds no continuation/user message.
 
 After manual compaction, the extension resumes the unfinished task only if the same session is idle and nobody submitted a new message. Text entered during compaction belongs to Pi's own queue and takes priority over automatic continuation. The resumed task is sent as one hidden custom message through Pi's normal session turn, avoiding competing prompts.
 

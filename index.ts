@@ -8,7 +8,7 @@
  */
 
 import {
-  AssistantMessageComponent, ToolExecutionComponent, InteractiveMode,
+  AgentSession, AssistantMessageComponent, ToolExecutionComponent, InteractiveMode,
   CustomEditor, type ExtensionAPI, type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -477,14 +477,95 @@ function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed:
   return { messages: result, removed };
 }
 
-function makeCodexErrorRetryable(errorText: string): string {
+export function installNativeCodexRetryPolicy(getLimit: () => number | undefined) {
+  let active = true;
+  let sessions = new WeakMap<object, any>();
+  // Shared across concurrently loaded WM instances, but present on a manager
+  // only during the synchronous native policy read (never during backoff).
+  const rootKey = Symbol.for("pi-workspace-manager:native-retry-settings-root");
+  const undo: (() => void)[] = [];
+  const remember = (session: any) => {
+    if (session.sessionManager) sessions.set(session.sessionManager, session);
+  };
+  const lastAssistant = (messages: any[]) => messages?.findLast((message) => message.role === "assistant");
+  const withPolicy = (session: any, message: any, call: () => any) => {
+    if (!active) return call();
+    remember(session);
+    const manager = session.settingsManager;
+    const limit = getLimit();
+    const provider = message?.provider ?? session.model?.provider;
+    // A nested callback may share a SettingsManager with another session.
+    // Read the root getter so the outer Codex override never leaks into it.
+    if (!manager || typeof manager.getRetrySettings !== "function") return call();
+    const existing = manager[rootKey];
+    if ((provider !== "openai-codex" || limit === undefined) && !existing) return call();
+    const root = existing ?? { read: manager.getRetrySettings, depth: 0 };
+    const descriptor = Object.getOwnPropertyDescriptor(manager, "getRetrySettings");
+    if ((descriptor && !descriptor.configurable) || (!existing && !Object.isExtensible(manager))) return call();
+    if (!existing) Object.defineProperty(manager, rootKey, { configurable: true, value: root });
+    root.depth++;
+    const replacement = function () {
+      const settings = root.read.call(manager);
+      return provider === "openai-codex" && limit !== undefined
+        ? { ...settings, maxRetries: limit } : settings;
+    };
+    Object.defineProperty(manager, "getRetrySettings", { configurable: true, writable: true, value: replacement });
+    try { return call(); }
+    finally {
+      // Pi reads this policy synchronously before its first backoff await.
+      // Restore immediately, not after sleep, so all other operations retain
+      // their own settings. No client file or persistent setting is modified.
+      if (manager.getRetrySettings === replacement) {
+        if (descriptor) Object.defineProperty(manager, "getRetrySettings", descriptor);
+        else delete manager.getRetrySettings;
+      }
+      root.depth--;
+      if (root.depth === 0 && manager[rootKey] === root) delete manager[rootKey];
+    }
+  };
+  const patch = (name: string, wrap: (original: any) => any) => {
+    const prototype = AgentSession.prototype as any;
+    const original = prototype[name];
+    if (typeof original !== "function") throw new Error(`Pi Codex retry policy requires ${name}`);
+    const replacement = wrap(original);
+    prototype[name] = replacement;
+    undo.push(() => { if (prototype[name] === replacement) prototype[name] = original; });
+  };
+  for (const name of ["_emitExtensionEvent", "_willRetryAfterAgentEnd", "_prepareRetry"]) {
+    if (typeof (AgentSession.prototype as any)[name] !== "function") throw new Error(`Pi Codex retry policy requires ${name}`);
+  }
+  patch("_emitExtensionEvent", (original) => function (this: any, event: any) {
+    if (active && event.type === "agent_end") remember(this);
+    return original.call(this, event);
+  });
+  patch("_willRetryAfterAgentEnd", (original) => function (this: any, event: any) {
+    return withPolicy(this, lastAssistant(event.messages), () => original.call(this, event));
+  });
+  patch("_prepareRetry", (original) => function (this: any, message: any) {
+    return withPolicy(this, message, () => original.call(this, message));
+  });
+  return {
+    snapshotFor(manager: object): { attempt: number; enabled: boolean } | undefined {
+      const session = sessions.get(manager);
+      return session ? { attempt: session.retryAttempt ?? 0, enabled: session.settingsManager.getRetrySettings().enabled } : undefined;
+    },
+    uninstall() {
+      active = false;
+      sessions = new WeakMap();
+      for (const restore of undo.reverse()) restore();
+    },
+  };
+}
+
+export function makeCodexErrorRetryable(errorText: string): string {
   // Pi's retry classifier checks these explicit account/quota exclusions before
   // its positive retry patterns. Break only those exact phrases with invisible
   // separators so the original diagnostic remains readable while the system
   // retry classifier can handle the error as requested.
   const nonRetryableLimitError = /GoUsageLimitError|FreeUsageLimitError|Monthly usage limit reached|available balance|insufficient_quota|out of budget|quota exceeded|billing/gi;
-  const retryableText = errorText.replace(nonRetryableLimitError, (match) => [...match].join("\u200B"));
-  return `${retryableText}\n[pi-workspace-manager: retryable Codex server error]`;
+  const marker = "\n[pi-workspace-manager: retryable Codex server error]";
+  const retryableText = errorText.split(marker).join("").replace(nonRetryableLimitError, (match) => [...match].join("\u200B"));
+  return `${retryableText}${marker}`;
 }
 
 function getLatestUserTask(entries: readonly any[]): string {
@@ -1157,11 +1238,13 @@ export default function (pi: ExtensionAPI) {
   });
   pi.on("session_tree", (_event, ctx) => replayInteractionTimes(ctx));
   pi.on("session_compact", (_event, ctx) => replayInteractionTimes(ctx));
-  // These counters only gate promotion to Pi's native retry path and the
-  // image-specific fallback. Retry scheduling, backoff, and cancellation stay
-  // in Pi's system retry implementation.
-  let codexRetryAttempts = 0;
+  // Adjust only Codex's native message-retry budget, not global settings,
+  // provider-level HTTP retries or other models. Pi still owns the loop/UI.
+  const createCodexRetryPolicy = () => installNativeCodexRetryPolicy(() =>
+    managerConfig.codexRetry.enabled ? managerConfig.codexRetry.maxRetries : undefined);
+  let codexRetryPolicy: ReturnType<typeof installNativeCodexRetryPolicy> | undefined = createCodexRetryPolicy();
   let codexImageRetryAttempts = 0;
+  let lastCodexError: any;
   let stripImagesForCodexRetry = false;
 
   const applyManagedToolAvailability = () => {
@@ -1310,12 +1393,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Promote every OpenAI Codex assistant error to Pi's native retry classifier.
-  // Pi still owns retry budgets, backoff, cancellation, and retry UI. Keep the
+  // WM supplies Codex's cap; Pi owns the counter, backoff, cancellation and UI. Keep the
   // historical-image fallback narrower: only repeated image-request failures
   // with image-bearing context should strip images from the next outbound try.
   pi.on("agent_end", (event, ctx) => {
-    const model = ctx.model;
-    if (model?.provider !== "openai-codex" || !managerConfig.codexRetry.enabled) return;
+    if (!managerConfig.codexRetry.enabled) return;
 
     let assistant: any;
     for (let i = event.messages.length - 1; i >= 0; i--) {
@@ -1325,17 +1407,17 @@ export default function (pi: ExtensionAPI) {
         break;
       }
     }
-    if (!assistant) return;
+    if (!assistant || (assistant.provider ?? ctx.model?.provider) !== "openai-codex") return;
 
     if (assistant.stopReason !== "error") {
-      codexRetryAttempts = 0;
       codexImageRetryAttempts = 0;
+      lastCodexError = undefined;
       stripImagesForCodexRetry = false;
       return;
     }
 
-    if (codexRetryAttempts >= managerConfig.codexRetry.maxRetries) return;
-    codexRetryAttempts++;
+    const native = codexRetryPolicy?.snapshotFor(ctx.sessionManager);
+    if ((native && !native.enabled) || (native?.attempt ?? 0) >= managerConfig.codexRetry.maxRetries) return;
 
     const errorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
     const hasImageHistory = countImageBlocks(ctx.sessionManager.getBranch()) > 0;
@@ -1343,24 +1425,18 @@ export default function (pi: ExtensionAPI) {
       /bad request/i.test(errorText) ||
       /(?:1009|message\s+too\s+big|request\s+(?:body\s+)?(?:too\s+large|size)|inline.?image|image_url)/i.test(errorText)
     );
-    if (looksLikeImageRequestFailure) {
+    if (looksLikeImageRequestFailure && lastCodexError !== assistant) {
       codexImageRetryAttempts++;
       // After three matching image-request failures, let the next retry use
       // an image-free model context; the persisted transcript stays untouched.
       if (codexImageRetryAttempts >= 3) stripImagesForCodexRetry = true;
     }
 
-    const original = errorText || "Codex returned an error.";
-    assistant.errorMessage = makeCodexErrorRetryable(original);
-    if (ctx.hasUI) {
-      const imageFallback = stripImagesForCodexRetry
-        ? "; next retry will omit historical images from the outbound context"
-        : "";
-      ctx.ui.notify(
-        `Codex error; scheduling system retry (${codexRetryAttempts}/${managerConfig.codexRetry.maxRetries})${imageFallback}.`,
-        "warning",
-      );
-    }
+    lastCodexError = assistant;
+    assistant.errorMessage = makeCodexErrorRetryable(errorText || "Codex returned an error.");
+    // Do not claim that another retry was scheduled here. agent_end runs
+    // BEFORE Pi checks cancellation and creates its backoff. Its native
+    // auto_retry_start event is the authoritative progress indicator.
   });
 
   // Apply the image fallback only to the next retry request. The
@@ -1370,21 +1446,20 @@ export default function (pi: ExtensionAPI) {
     const sanitized = stripImageBlocks(event.messages);
     stripImagesForCodexRetry = false;
     if (sanitized.removed === 0) return;
-    // Clearing the poisoned image context starts a fresh retry sequence. Do
-    // not carry the previous failed sequence into the next Codex error.
-    codexRetryAttempts = 0;
+    // The image-failure streak resets, but the native total budget does not.
+    // Removing images must never grant extra retries beyond the configured cap.
     codexImageRetryAttempts = 0;
+    lastCodexError = undefined;
     if (ctx.hasUI) {
       ctx.ui.notify(`Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
     return { messages: sanitized.messages };
   });
 
-  // Reset both retry counters after settlement so each independent run starts
-  // with a fresh budget.
+  // Pi resets its own retry budget. Reset only the image-failure state here.
   pi.on("agent_settled", () => {
-    codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;
+    lastCodexError = undefined;
     stripImagesForCodexRetry = false;
   });
 
@@ -1412,6 +1487,7 @@ export default function (pi: ExtensionAPI) {
     timestampUi = timestampMode ? ctx.ui : undefined;
     replayInteractionTimes(ctx);
     timestampRenderers ??= createTimestampRenderers();
+    codexRetryPolicy ??= createCodexRetryPolicy();
     scheduleTimestampDateRefresh();
     if (ctx.mode !== "tui") return;
     const previousFactory = ctx.ui.getEditorComponent();
@@ -1454,8 +1530,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
-    codexRetryAttempts = 0;
     codexImageRetryAttempts = 0;
+    lastCodexError = undefined;
     stripImagesForCodexRetry = false;
     managerConfig = loadManagerConfig();
     applyManagedToolAvailability();
@@ -2043,7 +2119,7 @@ export default function (pi: ExtensionAPI) {
           {
             id: "codexRetry.maxRetries",
             label: "Codex retry · maximum retries",
-            description: "Maximum Codex assistant errors promoted to the system retry path",
+            description: "Actual native Codex retries after the first failure; other providers retain Pi's retry.maxRetries.",
             currentValue: String(managerConfig.codexRetry.maxRetries),
             submenu: (currentValue, finish) => createValueSubmenu("Maximum Codex retries", retryValues, currentValue, finish),
           },
@@ -2475,8 +2551,10 @@ export default function (pi: ExtensionAPI) {
     interactionTimes.clear();
     shellTimings.clear();
     sessionActive = false;
-    codexRetryAttempts = 0;
+    codexRetryPolicy?.uninstall();
+    codexRetryPolicy = undefined;
     codexImageRetryAttempts = 0;
+    lastCodexError = undefined;
     stripImagesForCodexRetry = false;
     if (pendingCompactRequest) clearPendingCompaction(pendingCompactRequest);
   });
