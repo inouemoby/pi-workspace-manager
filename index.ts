@@ -443,68 +443,110 @@ function getMessageText(content: unknown): string {
   }).filter(Boolean).join("\n");
 }
 
-// Outbound image size (user 2026-11-26): every image sent to a model follows
-// the same limits as Pi's own read tool (resizeImage defaults: 2000x2000,
-// 4.5 MB, or the model's inputLimits.images.resize). Pi already normalizes new
-// tool results; this also covers pasted images and older session history.
-// Results are cached by payload so each image is resized once per process.
+// Outbound images (user 2026-11-26):
+// 1. Every image is first fitted to the read tool's limits (resizeImage defaults
+//    2000x2000 / 4.5 MB, or the model's inputLimits.images.resize).
+// 2. Then re-encoded as lossy WebP q85 at that resolution with sharp; kept only
+//    when smaller than the input (sharp missing -> step 1 result is used).
+// 3. Total image payload per request is capped at 17 MB: past that, the oldest
+//    images become a text placeholder; the newest 4 are never dropped.
+// Each image is processed once per process (cached by payload).
+const IMAGE_WEBP_QUALITY = 85;
+const IMAGE_BUDGET_BYTES = 17 * 1024 * 1024;
+const IMAGE_KEEP_NEWEST = 4;
 const resizedImageCache = new Map<string, { data: string; mimeType: string; note?: string }>();
+let sharpModule: any | null | undefined;
+
+async function loadSharp(): Promise<any | null> {
+  if (sharpModule !== undefined) return sharpModule;
+  try {
+    const mod: any = await import("sharp");
+    sharpModule = mod.default ?? mod;
+  } catch {
+    sharpModule = null;
+  }
+  return sharpModule;
+}
 
 function imageCacheKey(block: { data: string; mimeType?: string }): string {
   const d = block.data;
   return `${block.mimeType}|${d.length}|${d.slice(0, 64)}|${d.slice(-64)}`;
 }
 
+async function encodeOutboundImage(part: { data: string; mimeType: string }, resizeOptions: unknown) {
+  let data = part.data;
+  let mimeType = part.mimeType;
+  let note: string | undefined;
+  try {
+    const r = await resizeImage(Buffer.from(part.data, "base64"), part.mimeType, resizeOptions as any);
+    if (r && r.wasResized) {
+      data = r.data;
+      mimeType = r.mimeType;
+      note = formatDimensionNote(r);
+    }
+  } catch { /* keep the original */ }
+  const sharp = await loadSharp();
+  if (sharp && mimeType !== "image/gif") {
+    try {
+      const webp: Buffer = await sharp(Buffer.from(data, "base64")).webp({ quality: IMAGE_WEBP_QUALITY }).toBuffer();
+      const encoded = webp.toString("base64");
+      if (encoded.length < data.length) {
+        data = encoded;
+        mimeType = "image/webp";
+      }
+    } catch { /* keep the resized/original image */ }
+  }
+  return { data, mimeType, note };
+}
+
 async function resizeOutboundImages(messages: readonly any[], resizeOptions: unknown): Promise<{ messages: any[]; resized: number } | undefined> {
   let resized = 0;
   let changed = false;
-  const out: any[] = [];
-  for (const message of messages) {
+  const out: any[] = messages.map((message) => {
     if (!message || typeof message !== "object" || !Array.isArray(message.content) ||
-        !message.content.some((part: any) => part?.type === "image" && typeof part.data === "string")) {
-      out.push(message);
-      continue;
-    }
-    const content: any[] = [];
-    let messageChanged = false;
-    for (const part of message.content) {
-      if (part?.type !== "image" || typeof part.data !== "string") {
-        content.push(part);
-        continue;
-      }
+        !message.content.some((part: any) => part?.type === "image" && typeof part.data === "string")) return message;
+    return { ...message, content: [...message.content] };
+  });
+  // Encode every image (cached).
+  const slots: { m: number; i: number; size: number }[] = [];
+  for (let m = 0; m < out.length; m++) {
+    if (out[m] === messages[m]) continue;
+    const content = out[m].content;
+    for (let i = 0; i < content.length; i++) {
+      const part = content[i];
+      if (part?.type !== "image" || typeof part.data !== "string") continue;
       const key = imageCacheKey(part);
       let result = resizedImageCache.get(key);
       if (!result) {
-        try {
-          const r = await resizeImage(Buffer.from(part.data, "base64"), part.mimeType, resizeOptions as any);
-          // Same as read: shrink only when over the limits (format and quality kept
-          // otherwise) and tell the model the original size so coordinates map back.
-          result = r && r.wasResized
-            ? { data: r.data, mimeType: r.mimeType, note: formatDimensionNote(r) }
-            : { data: part.data, mimeType: part.mimeType };
-        } catch {
-          result = { data: part.data, mimeType: part.mimeType };
-        }
+        result = await encodeOutboundImage(part, resizeOptions);
         if (resizedImageCache.size > 500) resizedImageCache.clear();
         resizedImageCache.set(key, result);
       }
       if (result.data !== part.data) {
         resized++;
-        messageChanged = true;
-        content.push({ ...part, data: result.data, mimeType: result.mimeType });
-        if (result.note) content.push({ type: "text", text: result.note });
-      } else {
-        content.push(part);
+        changed = true;
+        content[i] = { ...part, data: result.data, mimeType: result.mimeType };
+        if (result.note) {
+          content.splice(i + 1, 0, { type: "text", text: result.note });
+          i++;
+        }
       }
-    }
-    if (messageChanged) {
-      changed = true;
-      out.push({ ...message, content });
-    } else {
-      out.push(message);
+      slots.push({ m, i: content[i]?.type === "image" ? i : i - 1, size: content[i]?.type === "image" ? content[i].data.length : content[i - 1].data.length });
     }
   }
-  return changed ? { messages: out, resized } : undefined;
+  // Budget: drop oldest images beyond the cap, never the newest few.
+  let total = slots.reduce((sum, slot) => sum + slot.size, 0);
+  for (let k = 0; k < slots.length - IMAGE_KEEP_NEWEST && total > IMAGE_BUDGET_BYTES; k++) {
+    const slot = slots[k];
+    out[slot.m].content[slot.i] = {
+      type: "text",
+      text: "[Earlier image omitted to keep the request within the image size budget; use the available text context.]",
+    };
+    total -= slot.size;
+    changed = true;
+  }
+  if (!changed) return undefined;
+  return { messages: out.map((message, idx) => (message === messages[idx] ? message : message)), resized };
 }
 
 function isImageBlock(value: unknown): boolean {
