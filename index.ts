@@ -1270,6 +1270,9 @@ export default function (pi: ExtensionAPI) {
   // Pi treats 413 as context overflow and may not retry; keep the strip
   // request across agent_settled so the user's next turn goes out image-free.
   let stripImagesAfterTooLarge: string | undefined;
+  // One automatic continuation per failure streak once images are to be
+  // stripped, so the user does not have to ask the agent to continue.
+  let imageAutoResumed = false;
 
   const applyManagedToolAvailability = () => {
     const active = new Set(pi.getActiveTools());
@@ -1433,6 +1436,7 @@ export default function (pi: ExtensionAPI) {
     const provider = assistant.provider ?? ctx.model?.provider;
     if (provider !== "openai-codex") {
       if (assistant.stopReason !== "error") {
+        imageAutoResumed = false;
         imageRetryAttempts = 0;
         lastImageError = undefined;
         imageFallbackUsed = false;
@@ -1457,6 +1461,7 @@ export default function (pi: ExtensionAPI) {
     if (!managerConfig.codexRetry.enabled) return;
 
     if (assistant.stopReason !== "error") {
+      imageAutoResumed = false;
       codexImageRetryAttempts = 0;
       lastCodexError = undefined;
       stripImagesForCodexRetry = false;
@@ -1522,7 +1527,23 @@ export default function (pi: ExtensionAPI) {
   });
 
   // Pi resets its own retry budget. Reset only the image-failure state here.
-  pi.on("agent_settled", () => {
+  pi.on("agent_settled", (_event, ctx) => {
+    // If the turn ended in an image-related failure and the image-free retry
+    // has not been sent yet, continue the interrupted turn automatically.
+    const pendingStrip = stripImagesAfterTooLarge ?? stripImagesForRetryProvider ??
+      (stripImagesForCodexRetry ? "openai-codex" : undefined);
+    if (pendingStrip && !imageAutoResumed && !ctx?.hasPendingMessages?.()) {
+      imageAutoResumed = true;
+      stripImagesAfterTooLarge = pendingStrip;
+      setTimeout(() => {
+        try {
+          pi.sendMessage({ customType: RECOVERY_MARKER, content: [], display: false }, { triggerTurn: true });
+          if (ctx?.hasUI) ctx.ui.notify("Image request failed: continuing without historical images.", "warning");
+        } catch (error) {
+          if (ctx?.hasUI) ctx.ui.notify(`Could not continue without images: ${error instanceof Error ? error.message : String(error)}`, "error");
+        }
+      }, 0);
+    }
     stripImagesForRetryProvider = undefined;
     imageRetryAttempts = 0;
     lastImageError = undefined;
