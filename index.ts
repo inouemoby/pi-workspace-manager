@@ -9,7 +9,7 @@
 
 import {
   AgentSession, AssistantMessageComponent, ToolExecutionComponent, InteractiveMode,
-  CustomEditor, type ExtensionAPI, type ExtensionContext,
+  CustomEditor, type ExtensionAPI, type ExtensionContext, resizeImage, formatDimensionNote,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
@@ -441,6 +441,70 @@ function getMessageText(content: unknown): string {
     }
     return "";
   }).filter(Boolean).join("\n");
+}
+
+// Outbound image size (user 2026-11-26): every image sent to a model follows
+// the same limits as Pi's own read tool (resizeImage defaults: 2000x2000,
+// 4.5 MB, or the model's inputLimits.images.resize). Pi already normalizes new
+// tool results; this also covers pasted images and older session history.
+// Results are cached by payload so each image is resized once per process.
+const resizedImageCache = new Map<string, { data: string; mimeType: string; note?: string }>();
+
+function imageCacheKey(block: { data: string; mimeType?: string }): string {
+  const d = block.data;
+  return `${block.mimeType}|${d.length}|${d.slice(0, 64)}|${d.slice(-64)}`;
+}
+
+async function resizeOutboundImages(messages: readonly any[], resizeOptions: unknown): Promise<{ messages: any[]; resized: number } | undefined> {
+  let resized = 0;
+  let changed = false;
+  const out: any[] = [];
+  for (const message of messages) {
+    if (!message || typeof message !== "object" || !Array.isArray(message.content) ||
+        !message.content.some((part: any) => part?.type === "image" && typeof part.data === "string")) {
+      out.push(message);
+      continue;
+    }
+    const content: any[] = [];
+    let messageChanged = false;
+    for (const part of message.content) {
+      if (part?.type !== "image" || typeof part.data !== "string") {
+        content.push(part);
+        continue;
+      }
+      const key = imageCacheKey(part);
+      let result = resizedImageCache.get(key);
+      if (!result) {
+        try {
+          const r = await resizeImage(Buffer.from(part.data, "base64"), part.mimeType, resizeOptions as any);
+          // Same as read: shrink only when over the limits (format and quality kept
+          // otherwise) and tell the model the original size so coordinates map back.
+          result = r && r.wasResized
+            ? { data: r.data, mimeType: r.mimeType, note: formatDimensionNote(r) }
+            : { data: part.data, mimeType: part.mimeType };
+        } catch {
+          result = { data: part.data, mimeType: part.mimeType };
+        }
+        if (resizedImageCache.size > 500) resizedImageCache.clear();
+        resizedImageCache.set(key, result);
+      }
+      if (result.data !== part.data) {
+        resized++;
+        messageChanged = true;
+        content.push({ ...part, data: result.data, mimeType: result.mimeType });
+        if (result.note) content.push({ type: "text", text: result.note });
+      } else {
+        content.push(part);
+      }
+    }
+    if (messageChanged) {
+      changed = true;
+      out.push({ ...message, content });
+    } else {
+      out.push(message);
+    }
+  }
+  return changed ? { messages: out, resized } : undefined;
 }
 
 function isImageBlock(value: unknown): boolean {
@@ -1531,6 +1595,12 @@ export default function (pi: ExtensionAPI) {
       ctx.ui.notify(`${trigger}: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
     return { messages: sanitized.messages };
+  });
+
+  pi.on("context", async (event, ctx) => {
+    const resizeOptions = (ctx.model as any)?.inputLimits?.images?.resize;
+    const result = await resizeOutboundImages(event.messages, resizeOptions);
+    if (result) return { messages: result.messages };
   });
 
   // Pi resets its own retry budget. Reset only the image-failure state here.
