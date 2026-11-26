@@ -474,20 +474,21 @@ function isRequestTooLargeWithImages(errorText: string, branch: unknown): boolea
     /\b413\b|request\s+entity\s+too\s+large|payload\s+too\s+large/i.test(errorText);
 }
 
-export const IMAGE_CUTOFF_ENTRY = "pi-workspace-manager:image-cutoff";
-
-function latestImageCutoff(branch: readonly any[], memory: number | undefined): number | undefined {
-  let at = memory ?? 0;
+// The single image boundary (user 2026-11-26): the latest compaction. Every
+// request omits the images carried in the compacted context, i.e. messages
+// from before that compaction; images read after it are sent normally.
+function latestCompactionTime(branch: readonly any[]): number | undefined {
+  let at = 0;
   for (const entry of branch) {
-    if (entry?.type === "custom" && entry.customType === IMAGE_CUTOFF_ENTRY && Number.isFinite(entry.data?.at)) {
-      at = Math.max(at, entry.data.at);
-    }
+    if (entry?.type !== "compaction") continue;
+    const t = typeof entry.timestamp === "string" ? Date.parse(entry.timestamp) : Number(entry.timestamp);
+    if (Number.isFinite(t)) at = Math.max(at, t);
   }
   return at || undefined;
 }
 
-// Without a cutoff every image is replaced; with one, only images in messages
-// at or before it (messages without a timestamp count as old).
+// Without a cutoff every image is replaced (one-shot failure retry); with one,
+// only images in messages at or before it (no timestamp counts as old).
 function stripImageBlocks(messages: readonly any[], cutoff?: number): { messages: any[]; removed: number } {
   let removed = 0;
   const result = messages.map((message) => {
@@ -498,7 +499,7 @@ function stripImageBlocks(messages: readonly any[], cutoff?: number): { messages
       removed++;
       return {
         type: "text",
-        text: "[Earlier image omitted after an image request failure; use the available text context.]",
+        text: "[Earlier image omitted from the outbound context; use the available text context.]",
       };
     });
     return { ...message, content };
@@ -1288,7 +1289,6 @@ export default function (pi: ExtensionAPI) {
   // One automatic continuation per failure streak once images are to be
   // stripped, so the user does not have to ask the agent to continue.
   let imageAutoResumed = false;
-  let imageCutoffAt: number | undefined;
 
   const applyManagedToolAvailability = () => {
     const active = new Set(pi.getActiveTools());
@@ -1520,18 +1520,15 @@ export default function (pi: ExtensionAPI) {
       // The image-failure streak resets, but the native total budget does not.
       codexImageRetryAttempts = 0;
       lastCodexError = undefined;
-      // Persist a cutoff (user 2026-11-26): from now on every request omits all
-      // images older than this point, including those kept through compaction;
-      // images read later are sent normally until the next failure moves it.
-      imageCutoffAt = Date.now();
-      try { pi.appendEntry(IMAGE_CUTOFF_ENTRY, { at: imageCutoffAt }); } catch { /* memory cutoff still applies */ }
     }
-    const cutoff = latestImageCutoff(ctx.sessionManager.getBranch(), imageCutoffAt);
-    if (!cutoff) return;
+    // Failure retry: this one request goes out with no images at all.
+    // Otherwise: always drop the images of the compacted context.
+    const cutoff = trigger ? undefined : latestCompactionTime(ctx.sessionManager.getBranch());
+    if (!trigger && !cutoff) return;
     const sanitized = stripImageBlocks(event.messages, cutoff);
     if (sanitized.removed === 0) return;
     if (trigger && ctx.hasUI) {
-      ctx.ui.notify(`${trigger}: omitted ${sanitized.removed} historical image(s); older images stay out of later requests.`, "warning");
+      ctx.ui.notify(`${trigger}: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
     }
     return { messages: sanitized.messages };
   });
@@ -1630,7 +1627,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
-    imageCutoffAt = undefined;
     codexImageRetryAttempts = 0;
     lastCodexError = undefined;
     stripImagesForCodexRetry = false;
