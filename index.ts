@@ -467,6 +467,13 @@ function looksLikeImageRequestFailure(errorText: string, branch: unknown): boole
   );
 }
 
+// HTTP 413 "Request Entity Too Large" with image-bearing history is treated as
+// the image-history problem itself (user 2026-11-26): strip images right away.
+function isRequestTooLargeWithImages(errorText: string, branch: unknown): boolean {
+  return countImageBlocks(branch) > 0 &&
+    /\b413\b|request\s+entity\s+too\s+large|payload\s+too\s+large/i.test(errorText);
+}
+
 function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed: number } {
   let removed = 0;
   const result = messages.map((message) => {
@@ -1260,6 +1267,9 @@ export default function (pi: ExtensionAPI) {
   let imageRetryAttempts = 0;
   let lastImageError: any;
   let imageFallbackUsed = false;
+  // Pi treats 413 as context overflow and may not retry; keep the strip
+  // request across agent_settled so the user's next turn goes out image-free.
+  let stripImagesAfterTooLarge: string | undefined;
 
   const applyManagedToolAvailability = () => {
     const active = new Set(pi.getActiveTools());
@@ -1430,11 +1440,14 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const otherErrorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
-      if (imageFallbackUsed || lastImageError === assistant ||
-          !looksLikeImageRequestFailure(otherErrorText, ctx.sessionManager.getBranch())) return;
+      if (imageFallbackUsed || lastImageError === assistant) return;
+      const branch = ctx.sessionManager.getBranch();
+      const tooLarge = isRequestTooLargeWithImages(otherErrorText, branch);
+      if (!tooLarge && !looksLikeImageRequestFailure(otherErrorText, branch)) return;
       lastImageError = assistant;
       imageRetryAttempts++;
-      if (imageRetryAttempts >= 3) {
+      if (tooLarge) stripImagesAfterTooLarge = provider;
+      if (tooLarge || imageRetryAttempts >= 3) {
         imageFallbackUsed = true;
         stripImagesForRetryProvider = provider;
       }
@@ -1454,7 +1467,10 @@ export default function (pi: ExtensionAPI) {
     if ((native && !native.enabled) || (native?.attempt ?? 0) >= managerConfig.codexRetry.maxRetries) return;
 
     const errorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
-    if (looksLikeImageRequestFailure(errorText, ctx.sessionManager.getBranch()) && lastCodexError !== assistant) {
+    if (isRequestTooLargeWithImages(errorText, ctx.sessionManager.getBranch()) && lastCodexError !== assistant) {
+      stripImagesForCodexRetry = true;
+      stripImagesAfterTooLarge = "openai-codex";
+    } else if (looksLikeImageRequestFailure(errorText, ctx.sessionManager.getBranch()) && lastCodexError !== assistant) {
       codexImageRetryAttempts++;
       // After three matching image-request failures, let the next retry use
       // an image-free model context; the persisted transcript stays untouched.
@@ -1471,6 +1487,17 @@ export default function (pi: ExtensionAPI) {
   // Apply the image fallback only to the next retry request. The
   // session file and the visible/persisted conversation remain unchanged.
   pi.on("context", (event, ctx) => {
+    if (stripImagesAfterTooLarge && ctx.model?.provider === stripImagesAfterTooLarge) {
+      stripImagesAfterTooLarge = undefined;
+      stripImagesForRetryProvider = undefined;
+      stripImagesForCodexRetry = false;
+      const sanitized = stripImageBlocks(event.messages);
+      if (sanitized.removed === 0) return;
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Request too large: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
+      }
+      return { messages: sanitized.messages };
+    }
     if (stripImagesForRetryProvider && ctx.model?.provider === stripImagesForRetryProvider) {
       stripImagesForRetryProvider = undefined;
       const sanitized = stripImageBlocks(event.messages);
