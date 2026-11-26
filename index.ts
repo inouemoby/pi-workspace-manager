@@ -460,6 +460,13 @@ function countImageBlocks(value: unknown, seen = new Set<object>()): number {
   return Object.values(value).reduce((total, item) => total + countImageBlocks(item, seen), 0);
 }
 
+function looksLikeImageRequestFailure(errorText: string, branch: unknown): boolean {
+  return countImageBlocks(branch) > 0 && (
+    /bad request/i.test(errorText) ||
+    /(?:1009|message\s+too\s+big|request\s+(?:body\s+)?(?:too\s+large|size)|inline.?image|image_url|too\s+many\s+images|image.{0,40}(?:limit|exceed|maximum)|(?:limit|exceed|maximum).{0,40}image)/i.test(errorText)
+  );
+}
+
 function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed: number } {
   let removed = 0;
   const result = messages.map((message) => {
@@ -469,7 +476,7 @@ function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed:
       removed++;
       return {
         type: "text",
-        text: "[Image omitted after repeated Codex request failures; use the available text context.]",
+        text: "[Image omitted after repeated image request failures; use the available text context.]",
       };
     });
     return { ...message, content };
@@ -1246,6 +1253,13 @@ export default function (pi: ExtensionAPI) {
   let codexImageRetryAttempts = 0;
   let lastCodexError: any;
   let stripImagesForCodexRetry = false;
+  // Same historical-image fallback for every other provider: image-request
+  // failures are retried, and after three of them the next retry is sent
+  // without historical images (once; a failure after that is left to the user).
+  let stripImagesForRetryProvider: string | undefined;
+  let imageRetryAttempts = 0;
+  let lastImageError: any;
+  let imageFallbackUsed = false;
 
   const applyManagedToolAvailability = () => {
     const active = new Set(pi.getActiveTools());
@@ -1397,8 +1411,6 @@ export default function (pi: ExtensionAPI) {
   // historical-image fallback narrower: only repeated image-request failures
   // with image-bearing context should strip images from the next outbound try.
   pi.on("agent_end", (event, ctx) => {
-    if (!managerConfig.codexRetry.enabled) return;
-
     let assistant: any;
     for (let i = event.messages.length - 1; i >= 0; i--) {
       const candidate = event.messages[i];
@@ -1407,7 +1419,29 @@ export default function (pi: ExtensionAPI) {
         break;
       }
     }
-    if (!assistant || (assistant.provider ?? ctx.model?.provider) !== "openai-codex") return;
+    if (!assistant) return;
+    const provider = assistant.provider ?? ctx.model?.provider;
+    if (provider !== "openai-codex") {
+      if (assistant.stopReason !== "error") {
+        imageRetryAttempts = 0;
+        lastImageError = undefined;
+        imageFallbackUsed = false;
+        stripImagesForRetryProvider = undefined;
+        return;
+      }
+      const otherErrorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
+      if (imageFallbackUsed || lastImageError === assistant ||
+          !looksLikeImageRequestFailure(otherErrorText, ctx.sessionManager.getBranch())) return;
+      lastImageError = assistant;
+      imageRetryAttempts++;
+      if (imageRetryAttempts >= 3) {
+        imageFallbackUsed = true;
+        stripImagesForRetryProvider = provider;
+      }
+      assistant.errorMessage = makeCodexErrorRetryable(otherErrorText || "Image request failed.");
+      return;
+    }
+    if (!managerConfig.codexRetry.enabled) return;
 
     if (assistant.stopReason !== "error") {
       codexImageRetryAttempts = 0;
@@ -1420,12 +1454,7 @@ export default function (pi: ExtensionAPI) {
     if ((native && !native.enabled) || (native?.attempt ?? 0) >= managerConfig.codexRetry.maxRetries) return;
 
     const errorText = typeof assistant.errorMessage === "string" ? assistant.errorMessage : "";
-    const hasImageHistory = countImageBlocks(ctx.sessionManager.getBranch()) > 0;
-    const looksLikeImageRequestFailure = hasImageHistory && (
-      /bad request/i.test(errorText) ||
-      /(?:1009|message\s+too\s+big|request\s+(?:body\s+)?(?:too\s+large|size)|inline.?image|image_url)/i.test(errorText)
-    );
-    if (looksLikeImageRequestFailure && lastCodexError !== assistant) {
+    if (looksLikeImageRequestFailure(errorText, ctx.sessionManager.getBranch()) && lastCodexError !== assistant) {
       codexImageRetryAttempts++;
       // After three matching image-request failures, let the next retry use
       // an image-free model context; the persisted transcript stays untouched.
@@ -1442,6 +1471,15 @@ export default function (pi: ExtensionAPI) {
   // Apply the image fallback only to the next retry request. The
   // session file and the visible/persisted conversation remain unchanged.
   pi.on("context", (event, ctx) => {
+    if (stripImagesForRetryProvider && ctx.model?.provider === stripImagesForRetryProvider) {
+      stripImagesForRetryProvider = undefined;
+      const sanitized = stripImageBlocks(event.messages);
+      if (sanitized.removed === 0) return;
+      if (ctx.hasUI) {
+        ctx.ui.notify(`Image retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
+      }
+      return { messages: sanitized.messages };
+    }
     if (!stripImagesForCodexRetry || ctx.model?.provider !== "openai-codex") return;
     const sanitized = stripImageBlocks(event.messages);
     stripImagesForCodexRetry = false;
@@ -1458,6 +1496,10 @@ export default function (pi: ExtensionAPI) {
 
   // Pi resets its own retry budget. Reset only the image-failure state here.
   pi.on("agent_settled", () => {
+    stripImagesForRetryProvider = undefined;
+    imageRetryAttempts = 0;
+    lastImageError = undefined;
+    imageFallbackUsed = false;
     codexImageRetryAttempts = 0;
     lastCodexError = undefined;
     stripImagesForCodexRetry = false;
