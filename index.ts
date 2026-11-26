@@ -474,16 +474,31 @@ function isRequestTooLargeWithImages(errorText: string, branch: unknown): boolea
     /\b413\b|request\s+entity\s+too\s+large|payload\s+too\s+large/i.test(errorText);
 }
 
-function stripImageBlocks(messages: readonly any[]): { messages: any[]; removed: number } {
+export const IMAGE_CUTOFF_ENTRY = "pi-workspace-manager:image-cutoff";
+
+function latestImageCutoff(branch: readonly any[], memory: number | undefined): number | undefined {
+  let at = memory ?? 0;
+  for (const entry of branch) {
+    if (entry?.type === "custom" && entry.customType === IMAGE_CUTOFF_ENTRY && Number.isFinite(entry.data?.at)) {
+      at = Math.max(at, entry.data.at);
+    }
+  }
+  return at || undefined;
+}
+
+// Without a cutoff every image is replaced; with one, only images in messages
+// at or before it (messages without a timestamp count as old).
+function stripImageBlocks(messages: readonly any[], cutoff?: number): { messages: any[]; removed: number } {
   let removed = 0;
   const result = messages.map((message) => {
     if (!message || typeof message !== "object" || !Array.isArray(message.content)) return message;
+    if (cutoff !== undefined && Number.isFinite(message.timestamp) && message.timestamp > cutoff) return message;
     const content = message.content.map((part: unknown) => {
       if (!isImageBlock(part)) return part;
       removed++;
       return {
         type: "text",
-        text: "[Image omitted after repeated image request failures; use the available text context.]",
+        text: "[Earlier image omitted after an image request failure; use the available text context.]",
       };
     });
     return { ...message, content };
@@ -1273,6 +1288,7 @@ export default function (pi: ExtensionAPI) {
   // One automatic continuation per failure streak once images are to be
   // stripped, so the user does not have to ask the agent to continue.
   let imageAutoResumed = false;
+  let imageCutoffAt: number | undefined;
 
   const applyManagedToolAvailability = () => {
     const active = new Set(pi.getActiveTools());
@@ -1492,36 +1508,30 @@ export default function (pi: ExtensionAPI) {
   // Apply the image fallback only to the next retry request. The
   // session file and the visible/persisted conversation remain unchanged.
   pi.on("context", (event, ctx) => {
-    if (stripImagesAfterTooLarge && ctx.model?.provider === stripImagesAfterTooLarge) {
+    const provider = ctx.model?.provider;
+    let trigger: string | undefined;
+    if (stripImagesAfterTooLarge && provider === stripImagesAfterTooLarge) trigger = "Request too large";
+    else if (stripImagesForRetryProvider && provider === stripImagesForRetryProvider) trigger = "Image retry";
+    else if (stripImagesForCodexRetry && provider === "openai-codex") trigger = "Codex retry";
+    if (trigger) {
       stripImagesAfterTooLarge = undefined;
       stripImagesForRetryProvider = undefined;
       stripImagesForCodexRetry = false;
-      const sanitized = stripImageBlocks(event.messages);
-      if (sanitized.removed === 0) return;
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Request too large: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
-      }
-      return { messages: sanitized.messages };
+      // The image-failure streak resets, but the native total budget does not.
+      codexImageRetryAttempts = 0;
+      lastCodexError = undefined;
+      // Persist a cutoff (user 2026-11-26): from now on every request omits all
+      // images older than this point, including those kept through compaction;
+      // images read later are sent normally until the next failure moves it.
+      imageCutoffAt = Date.now();
+      try { pi.appendEntry(IMAGE_CUTOFF_ENTRY, { at: imageCutoffAt }); } catch { /* memory cutoff still applies */ }
     }
-    if (stripImagesForRetryProvider && ctx.model?.provider === stripImagesForRetryProvider) {
-      stripImagesForRetryProvider = undefined;
-      const sanitized = stripImageBlocks(event.messages);
-      if (sanitized.removed === 0) return;
-      if (ctx.hasUI) {
-        ctx.ui.notify(`Image retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
-      }
-      return { messages: sanitized.messages };
-    }
-    if (!stripImagesForCodexRetry || ctx.model?.provider !== "openai-codex") return;
-    const sanitized = stripImageBlocks(event.messages);
-    stripImagesForCodexRetry = false;
+    const cutoff = latestImageCutoff(ctx.sessionManager.getBranch(), imageCutoffAt);
+    if (!cutoff) return;
+    const sanitized = stripImageBlocks(event.messages, cutoff);
     if (sanitized.removed === 0) return;
-    // The image-failure streak resets, but the native total budget does not.
-    // Removing images must never grant extra retries beyond the configured cap.
-    codexImageRetryAttempts = 0;
-    lastCodexError = undefined;
-    if (ctx.hasUI) {
-      ctx.ui.notify(`Codex retry: omitted ${sanitized.removed} historical image(s) from the outbound context.`, "warning");
+    if (trigger && ctx.hasUI) {
+      ctx.ui.notify(`${trigger}: omitted ${sanitized.removed} historical image(s); older images stay out of later requests.`, "warning");
     }
     return { messages: sanitized.messages };
   });
@@ -1620,6 +1630,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_start", async (_event, ctx) => {
     sessionActive = true;
+    imageCutoffAt = undefined;
     codexImageRetryAttempts = 0;
     lastCodexError = undefined;
     stripImagesForCodexRetry = false;
